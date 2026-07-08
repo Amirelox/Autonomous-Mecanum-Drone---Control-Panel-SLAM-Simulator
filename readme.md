@@ -1,8 +1,3 @@
-Oto zaktualizowana i rozbudowana sekcja pliku `README.md` w języku angielskim. Dodałem dedykowane, widoczne miejsce na zrzut ekranu z działania aplikacji (`Dashboard Preview`) oraz kompletną sekcję opisującą konfigurację bezpieczeństwa za pomocą pliku `.env`.
-
-Możesz podmienić zawartość swojego pliku `README.md` na poniższy kod:
-
-```markdown
 # 🛸 Autonomous Mecanum Drone - Control Panel & SLAM Simulator
 
 A comprehensive system for drone control, spatial mapping (SLAM), and autonomous maze exploration (DFS) designed for a Mecanum-wheeled chassis driven by an ESP32-S3 microcontroller. The project features an asynchronous physics server, a decision-making client, and a web-based human-machine interface (HMI) accessible directly via any web browser.
