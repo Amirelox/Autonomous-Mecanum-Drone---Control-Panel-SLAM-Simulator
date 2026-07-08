@@ -1,0 +1,6 @@
+.env
+__pycache__/
+*.log
+.streamlit/
+CPP/
+trash py/
