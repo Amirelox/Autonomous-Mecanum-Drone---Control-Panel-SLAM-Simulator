@@ -117,8 +117,18 @@ KEY_HEX = os.getenv("ROBOT_HMAC_KEY")
 clients = set()
 server_loop = None
 
+def _broadcast_done(ws, fut):
+    """Callback for async broadcast — cleans up on error without blocking."""
+    try:
+        fut.result()
+    except (ConnectionResetError, websockets.exceptions.ConnectionClosed):
+        clients.discard(ws)
+    except Exception as e:
+        log.warning(f"Broadcast send error: {e}")
+        clients.discard(ws)
+
 def broadcast_message(msg_dict):
-    """Thread-safe broadcast to all connected WebSocket clients."""
+    """Thread-safe non-blocking broadcast to all connected WebSocket clients."""
     global server_loop
     if not clients or not server_loop:
         return
@@ -126,9 +136,8 @@ def broadcast_message(msg_dict):
     loop = server_loop
     for ws in list(clients):
         try:
-            asyncio.run_coroutine_threadsafe(ws.send(msg), loop).result(timeout=1.0)
-        except (TimeoutError, ConnectionResetError, websockets.exceptions.ConnectionClosed):
-            clients.discard(ws)
+            fut = asyncio.run_coroutine_threadsafe(ws.send(msg), loop)
+            fut.add_done_callback(lambda f, ws=ws: _broadcast_done(ws, f))
         except Exception as e:
             log.warning(f"Broadcast error: {e}")
             clients.discard(ws)
