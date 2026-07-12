@@ -337,8 +337,7 @@ async def client_session(ws):
 
     async for msg in ws:
         data = json.loads(msg)
-        if "laser" not in data:
-            continue
+        has_laser = "laser" in data
 
         if "goal_cell" in data:
             controller.goal_cell = tuple(data["goal_cell"])
@@ -362,12 +361,37 @@ async def client_session(ws):
                 controller.stuck_frames = 0
                 log.info(f"⚡ Teleportacja udana! Rozpoczynam FAST RUN dla rundy {controller.current_benchmark_run if controller.benchmark_mode else 1}...")
                 controller.fast_run_start_time = time.time()
-            else:
-                continue
+            elif not has_laser:
+                continue  # Idle heartbeat while teleporting — skip
 
-        # --- STALL DETECTOR MECHANISM ----
+        # Always update position from any message (after stall detector reads old pos)
+        prev_px, prev_py = controller.pos_x, controller.pos_y
+        if "pos_x" in data:
+            controller.pos_x = data["pos_x"]
+            controller.pos_y = data["pos_y"]
+            controller.heading = data.get("heading", controller.heading)
+
+        # Skip SLAM/control processing if no laser data (idle heartbeat)
+        if not has_laser:
+            try:
+                cmd_from_dashboard = command_queue.get_nowait()
+                if cmd_from_dashboard == "reset":
+                    await ws.send(json.dumps({"cmd": "reset"}))
+                    command_queue.task_done()
+                    continue
+                elif isinstance(cmd_from_dashboard, dict):
+                    await ws.send(json.dumps(cmd_from_dashboard))
+                    command_queue.task_done()
+                    continue
+            except queue.Empty:
+                pass
+            command = controller.get_command()
+            await ws.send(json.dumps(command))
+            continue
+
+        # --- STALL DETECTOR MECHANISM (uses prev position before update) ----
         if controller.target_logic is not None and not controller.finished:
-            dist_moved = math.hypot(data["pos_x"] - controller.pos_x, data["pos_y"] - controller.pos_y)
+            dist_moved = math.hypot(data["pos_x"] - prev_px, data["pos_y"] - prev_py)
             if dist_moved < 0.05:
                 controller.stuck_frames += 1
             else:

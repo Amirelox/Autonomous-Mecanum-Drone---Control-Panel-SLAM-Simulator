@@ -274,6 +274,7 @@ def reset_entire_simulation():
 # ============================================================
 async def physics_loop():
     global robot_x, robot_y, robot_heading, robot_armed
+    idle_heartbeat = 0.0
     while True:
         with state_lock:
             local_paused = physics_paused
@@ -285,8 +286,11 @@ async def physics_loop():
             local_last_cmd = last_cmd_time
             local_sim_speed = SIM_SPEED
 
+        now = time.time()
+        robot_moved = False
+
         if not local_paused:
-            if time.time() - local_last_cmd > 0.5:
+            if now - local_last_cmd > 0.5:
                 with state_lock:
                     robot_armed = False
                 local_armed = False
@@ -299,10 +303,15 @@ async def physics_loop():
                 with state_lock:
                     if not is_collision(robot_x + g_vx * ROBOT_SPEED_SCALE, robot_y):
                         robot_x += g_vx * ROBOT_SPEED_SCALE
+                        robot_moved = True
                     if not is_collision(robot_x, robot_y + g_vy * ROBOT_SPEED_SCALE):
                         robot_y += g_vy * ROBOT_SPEED_SCALE
-                    robot_heading = new_heading
+                        robot_moved = True
+                    if abs(local_w) > 0.001:
+                        robot_heading = new_heading
+                        robot_moved = True
 
+            # --- ADAPTIVE BROADCAST ---
             # Snapshot shared state for broadcast under lock
             with state_lock:
                 snap_x = robot_x
@@ -316,41 +325,51 @@ async def physics_loop():
                 snap_goal_y = goal_y
                 snap_goal_logic = goal_logic
 
-            # Optimized laser ray calculation using numpy where possible
-            all_hits = []
-            for i in range(NUM_SENSORS):
-                s_hdg = math.radians(math.degrees(snap_heading) + SENSOR_ANGLES_DEG[i])
-                sx = snap_x + SENSOR_RADIUS * math.cos(s_hdg)
-                sy = snap_y + SENSOR_RADIUS * math.sin(s_hdg)
-                
-                for ang in ray_angles_deg:
-                    r_ang = s_hdg + math.radians(ang)
-                    dx, dy = math.cos(r_ang), math.sin(r_ang)
-                    dist, hit = float(SENSOR_RANGE + random.gauss(0, NOISE_STD)), False
+            if robot_moved:
+                # Full broadcast with laser data (robot is moving)
+                all_hits = []
+                for i in range(NUM_SENSORS):
+                    s_hdg = math.radians(math.degrees(snap_heading) + SENSOR_ANGLES_DEG[i])
+                    sx = snap_x + SENSOR_RADIUS * math.cos(s_hdg)
+                    sy = snap_y + SENSOR_RADIUS * math.sin(s_hdg)
                     
-                    # Ray march with early exit on wall hit
-                    max_steps = min(int(dist), SENSOR_RANGE)
-                    for d in range(1, max_steps):
-                        cx = int(sx + dx * d)
-                        cy = int(sy + dy * d)
-                        if 0 <= cy < snap_h and 0 <= cx < snap_w:
-                            if snap_maze[cy, cx] == 1:
-                                dist = float(d + random.gauss(0, NOISE_STD))
-                                hit = True
+                    for ang in ray_angles_deg:
+                        r_ang = s_hdg + math.radians(ang)
+                        dx, dy = math.cos(r_ang), math.sin(r_ang)
+                        dist, hit = float(SENSOR_RANGE + random.gauss(0, NOISE_STD)), False
+                        
+                        max_steps = min(int(dist), SENSOR_RANGE)
+                        for d in range(1, max_steps):
+                            cx = int(sx + dx * d)
+                            cy = int(sy + dy * d)
+                            if 0 <= cy < snap_h and 0 <= cx < snap_w:
+                                if snap_maze[cy, cx] == 1:
+                                    dist = float(d + random.gauss(0, NOISE_STD))
+                                    hit = True
+                                    break
+                            else:
                                 break
-                        else:
-                            break
-                    
-                    all_hits.append({"d": max(1.0, dist), "hit": hit})
+                        
+                        all_hits.append({"d": max(1.0, dist), "hit": hit})
 
-            at_meta = bool(math.hypot(snap_x - snap_goal_x, snap_y - snap_goal_y) < 15.0)
-            broadcast_message({
-                "pos_x": snap_x, "pos_y": snap_y, "heading": snap_heading,
-                "laser": all_hits, "at_meta": at_meta,
-                "maze_id": snap_maze_id, "goal_cell": snap_goal_logic
-            })
+                at_meta = bool(math.hypot(snap_x - snap_goal_x, snap_y - snap_goal_y) < 15.0)
+                broadcast_message({
+                    "pos_x": snap_x, "pos_y": snap_y, "heading": snap_heading,
+                    "laser": all_hits, "at_meta": at_meta,
+                    "maze_id": snap_maze_id, "goal_cell": snap_goal_logic
+                })
+            elif now - idle_heartbeat > 1.0:
+                # Idle heartbeat — just position, no laser data (saves CPU + bandwidth)
+                idle_heartbeat = now
+                at_meta = bool(math.hypot(snap_x - snap_goal_x, snap_y - snap_goal_y) < 15.0)
+                broadcast_message({
+                    "pos_x": snap_x, "pos_y": snap_y, "heading": snap_heading,
+                    "at_meta": at_meta, "maze_id": snap_maze_id, "goal_cell": snap_goal_logic
+                })
 
-        await asyncio.sleep(0.06 / max(0.1, local_sim_speed))
+        # Adaptive sleep: tight when armed, relaxed when idle
+        sleep_s = 0.03 / max(0.1, local_sim_speed) if local_armed else 0.1
+        await asyncio.sleep(sleep_s)
 
 def start_physics():
     loop = asyncio.new_event_loop()
