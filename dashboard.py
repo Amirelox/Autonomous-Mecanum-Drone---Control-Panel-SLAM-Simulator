@@ -12,7 +12,7 @@ from client import controller, prob_map
 from config import ROBOT_W_WIDTH, ROBOT_L_LENGTH
 
 st.set_page_config(page_title="Mecanum Drone Dashboard", layout="wide")
-st_autorefresh(interval=100, limit=100000, key="frameratesetter")
+st_autorefresh(interval=200, limit=100000, key="frameratesetter")
 
 if "dfs_running" not in st.session_state:
     st.session_state.dfs_running = False
@@ -92,24 +92,42 @@ def reset_explorer():
 # ============================================================
 # HMI RENDERING LAYOUT: TWO COLS APART
 # ============================================================
+# ============================================================
+# CACHING: Maze background is static — render once and reuse
+# ============================================================
+if "maze_cache" not in st.session_state:
+    st.session_state.maze_cache = None
+    st.session_state.maze_cache_key = None
+
 col1, col2 = st.columns(2)
 
 with col1:
     st.header("🌍 Simulator - Real World")
     if controller.phys_maze_data is not None:
-        real_maze = np.array(controller.phys_maze_data)
-        img_real = np.zeros((real_maze.shape[0], real_maze.shape[1], 3), dtype=np.uint8)
-        img_real[real_maze == 0] = [38, 38, 38]   
-        img_real[real_maze == 1] = [255, 255, 255] 
+        # Only rebuild maze background when data changes
+        maze_key = id(controller.phys_maze_data)
+        if maze_key != st.session_state.maze_cache_key:
+            real_maze = np.array(controller.phys_maze_data, dtype=np.uint8)
+            h, w = real_maze.shape
+            img_bg = np.zeros((h, w, 3), dtype=np.uint8)
+            img_bg[real_maze == 0] = [38, 38, 38]
+            img_bg[real_maze == 1] = [255, 255, 255]
+            
+            # Draw goal marker (static)
+            g_size = int(ROBOT_W_WIDTH)
+            gx_phys, gy_phys = client.logic_to_phys(controller.goal_cell[0], controller.goal_cell[1])
+            cv2.rectangle(img_bg,
+                          (int(gx_phys - g_size//2), int(gy_phys - g_size//2)),
+                          (int(gx_phys + g_size//2), int(gy_phys + g_size//2)),
+                          (255, 0, 0), -1)
+            
+            st.session_state.maze_cache = img_bg
+            st.session_state.maze_cache_key = maze_key
         
-        g_size = int(ROBOT_W_WIDTH)
-        gx_phys, gy_phys = client.logic_to_phys(controller.goal_cell[0], controller.goal_cell[1])
+        # Start from cached background and draw dynamic overlay
+        img_real = st.session_state.maze_cache.copy()
         
-        cv2.rectangle(img_real, 
-                      (int(gx_phys - g_size//2), int(gy_phys - g_size//2)), 
-                      (int(gx_phys + g_size//2), int(gy_phys + g_size//2)), 
-                      (255, 0, 0), -1)
-        
+        # Draw laser lines (dynamic)
         if hasattr(controller, 'laser_data') and controller.laser_data:
             from client import NUM_SENSORS, RAYS_PER_SENSOR, SENSOR_ANGLES_DEG, SENSOR_RADIUS, ray_angles_deg
             idx = 0
@@ -125,16 +143,15 @@ with col1:
                     cv2.line(img_real, (int(sx), int(sy)), (ex, ey), (255, 50, 50), 1)
                     idx += 1
         
+        # Draw robot rectangle (dynamic)
         rx, ry = int(controller.pos_x), int(controller.pos_y)
-        rw = int(ROBOT_W_WIDTH)
-        rl = int(ROBOT_L_LENGTH)
-        
+        rw, rl = int(ROBOT_W_WIDTH), int(ROBOT_L_LENGTH)
         if 0 <= ry < img_real.shape[0] and 0 <= rx < img_real.shape[1]:
-            cv2.rectangle(img_real, 
-                          (rx - rw//2, ry - rl//2), 
-                          (rx + rw//2, ry + rl//2), 
+            cv2.rectangle(img_real,
+                          (rx - rw//2, ry - rl//2),
+                          (rx + rw//2, ry + rl//2),
                           (30, 144, 255), -1)
-            
+        
         view_real = cv2.resize(img_real, DISPLAY_SIZE, interpolation=cv2.INTER_NEAREST)
         st.image(view_real, caption="Ground truth state vector layout (Live Lasers)")
     else:
@@ -143,18 +160,18 @@ with col1:
 with col2:
     st.header("🗺️ Client - SLAM Grid Map")
     
+    # Convert prob_map to display image
     img_gray = (1.0 - client.prob_map) * 255
     img_gray = np.clip(img_gray, 0, 255).astype(np.uint8)
     img_rgb = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2RGB)
     
     rx, ry = int(controller.pos_x), int(controller.pos_y)
-    rw = int(ROBOT_W_WIDTH)
-    rl = int(ROBOT_L_LENGTH)
+    rw, rl = int(ROBOT_W_WIDTH), int(ROBOT_L_LENGTH)
     
     if 0 <= ry < img_rgb.shape[0] and 0 <= rx < img_rgb.shape[1]:
-        cv2.rectangle(img_rgb, 
-                      (rx - rw//2, ry - rl//2), 
-                      (rx + rw//2, ry + rl//2), 
+        cv2.rectangle(img_rgb,
+                      (rx - rw//2, ry - rl//2),
+                      (rx + rw//2, ry + rl//2),
                       (30, 144, 255), -1)
         
     margin = 60
@@ -166,10 +183,9 @@ with col2:
     if max_x > min_x and max_y > min_y:
         cropped_map = img_rgb[min_y:max_y, min_x:max_x]
         view_slam_zoom = cv2.resize(cropped_map, DISPLAY_SIZE, interpolation=cv2.INTER_NEAREST)
-        st.image(view_slam_zoom, caption="Discovered tracking map (Live Auto-Zoom)")
     else:
         view_slam_zoom = cv2.resize(img_rgb, DISPLAY_SIZE, interpolation=cv2.INTER_NEAREST)
-        st.image(view_slam_zoom, caption="Discovered tracking map (Live Auto-Zoom)")
+    st.image(view_slam_zoom, caption="Discovered tracking map (Live Auto-Zoom)")
 
 st.markdown("---")
 

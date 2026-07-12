@@ -96,10 +96,6 @@ class DFSController:
         self.current_benchmark_run = 0
         self.fast_run_times = []
 
-        # --- LOG THROTTLING ---
-        self._last_log_state = {}
-        self._last_log_time = 0.0
-
         self._lock = threading.Lock()
 
     def _locked(self):
@@ -133,7 +129,7 @@ class DFSController:
                         prob_map[cy, cx] = max(0.0, prob_map[cy, cx] - 0.05)
 
                 if c_range >= 1:
-                    for d in np.arange(0, max(0.0, c_range - 12.0), 2.0):
+                    for d in range(0, int(max(0.0, c_range - 12.0)), 2):
                         r, c = phys_to_logic(sx + dx*d, sy + dy*d)
                         if 0 <= r < LOGIC_ROWS and 0 <= c < LOGIC_COLS and self.logic_map[r][c] == -1:
                             self.logic_map[r][c] = 0
@@ -488,18 +484,7 @@ async def client_session(ws):
         json_request = json.dumps(command)
         await ws.send(json_request)
 
-        # Throttled file logging: only write when state changes or every 1s max
-        now = time.time()
-        curr_state = (controller.current_logic_pos, controller.target_logic, json_request)
-        if curr_state != controller._last_log_state or now - controller._last_log_time >= 1.0:
-            controller._last_log_state = curr_state
-            controller._last_log_time = now
-            with open("api_client.log", "a", encoding="utf-8") as log_file:
-                log_file.write(
-                    f"Pos: {controller.current_logic_pos} | "
-                    f"Target: {controller.target_logic} | "
-                    f"REQ -> {json_request}\n"
-                )
+        # (File logging removed — use terminal logging instead)
 
 
 async def client_main():

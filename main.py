@@ -338,7 +338,6 @@ async def physics_loop():
             broadcast_message({
                 "pos_x": snap_x, "pos_y": snap_y, "heading": snap_heading,
                 "laser": all_hits, "at_meta": at_meta,
-                "phys_maze": snap_maze.tolist(),
                 "maze_id": snap_maze_id, "goal_cell": snap_goal_logic
             })
 
