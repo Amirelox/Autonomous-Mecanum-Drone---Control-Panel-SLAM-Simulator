@@ -9,9 +9,13 @@ import threading
 import queue
 import os
 import time
+import logging
 from dotenv import load_dotenv
 
 load_dotenv()
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(name)s] %(levelname)s: %(message)s')
+log = logging.getLogger("client")
 
 # Import centralized configuration constants
 from config import (
@@ -81,7 +85,7 @@ class DFSController:
         self.optimized_path = []
         self.exploration_path = [self.start]
 
-        # --- NOWOŚĆ: NIEZALEŻNY SYSTEM STOPERA DLA KAŻDEGO BIEGU ---
+        # --- NIEZALEŻNY SYSTEM STOPERA DLA KAŻDEGO BIEGU ---
         self.run_start_time = None
         self.exploration_duration = 0.0
         self.fast_run_duration = 0.0
@@ -91,6 +95,11 @@ class DFSController:
         self.benchmark_mode = False
         self.current_benchmark_run = 0
         self.fast_run_times = []
+
+        self._lock = threading.Lock()
+
+    def _locked(self):
+        return self._lock
 
     def update_map(self, pos_x, pos_y, heading, laser_data):
         """Processes ray hits to clear paths or plot walls onto the occupancy array maps."""
@@ -205,10 +214,9 @@ class DFSController:
                 self.last_vx, self.last_vy = 0.0, 0.0
 
     def get_command(self):
+        """Returns motion command. Returns stop immediately when finished."""
         if self.finished or self.target_phys is None:
-            manual_vx = getattr(self, 'last_vx', 0.0)
-            manual_vy = getattr(self, 'last_vy', 0.0)
-            return {"vx": manual_vx, "vy": manual_vy, "w": 0.0}
+            return {"vx": 0.0, "vy": 0.0, "w": 0.0}
 
         tx, ty = self.target_phys
         
@@ -317,180 +325,199 @@ def expand_map_if_needed(phys_x, phys_y, controller):
 
 command_queue = queue.Queue()
 
-async def client_loop():
-    try:
-        async with websockets.connect(ROBOT_WS, ping_interval=None, ping_timeout=None) as ws:
-            nonce = json.loads(await ws.recv())["nonce"]
-            await ws.send(json.dumps({"auth": hmac.new(bytes.fromhex(KEY_HEX), bytes.fromhex(nonce), hashlib.sha256).hexdigest()}))
-            if json.loads(await ws.recv()).get("auth") != "ok":
-                return
+async def client_session(ws):
+    """Single client session — processes messages until disconnect."""
+    nonce = json.loads(await ws.recv())["nonce"]
+    await ws.send(json.dumps({"auth": hmac.new(bytes.fromhex(KEY_HEX), bytes.fromhex(nonce), hashlib.sha256).hexdigest()}))
+    if json.loads(await ws.recv()).get("auth") != "ok":
+        log.error("Authentication failed")
+        return
 
-            with open("api_client.log", "w", encoding="utf-8") as log_file:
-                log_file.write("=== LOGS INITIALIZATION SUCCESSFUL ===\n")
+    log.info("Client authenticated successfully")
 
-            async for msg in ws:
-                data = json.loads(msg)
-                if "laser" not in data:
+    async for msg in ws:
+        data = json.loads(msg)
+        if "laser" not in data:
+            continue
+
+        if "goal_cell" in data:
+            controller.goal_cell = tuple(data["goal_cell"])
+
+        if "maze_id" in data:
+            if data["maze_id"] < controller.current_maze_id:
+                continue
+            elif data["maze_id"] > controller.current_maze_id:
+                controller.current_maze_id = data["maze_id"]
+                controller.reset_logic_and_maps(keep_benchmark=controller.benchmark_mode)
+                log.info(f"♻️ Wykryto nowy labirynt (ID: {controller.current_maze_id}). Czyszczenie mapy...")
+
+        if "phys_maze" in data:
+            controller.phys_maze_data = data["phys_maze"]
+
+        is_at_meta = data.get("at_meta", False)
+        if controller.teleporting:
+            if not is_at_meta:
+                controller.teleporting = False
+                controller.current_logic_pos = (1, 1)
+                controller.stuck_frames = 0
+                log.info(f"⚡ Teleportacja udana! Rozpoczynam FAST RUN dla rundy {controller.current_benchmark_run if controller.benchmark_mode else 1}...")
+                controller.fast_run_start_time = time.time()
+            else:
+                continue
+
+        # --- STALL DETECTOR MECHANISM ----
+        if controller.target_logic is not None and not controller.finished:
+            dist_moved = math.hypot(data["pos_x"] - controller.pos_x, data["pos_y"] - controller.pos_y)
+            if dist_moved < 0.05:
+                controller.stuck_frames += 1
+            else:
+                controller.stuck_frames = 0
+
+            if controller.stuck_frames >= 20:
+                r1, c1 = controller.current_logic_pos
+                r2, c2 = controller.target_logic
+                mid_r, mid_c = (r1 + r2) // 2, (c1 + c2) // 2
+                controller.logic_map[mid_r][mid_c] = 1 
+                if controller.target_logic in controller.visited:
+                    controller.visited.remove(controller.target_logic)
+                if controller.path_stack:
+                    controller.path_stack.pop()
+                controller.target_logic = None
+                controller.target_phys = None
+                controller.stuck_frames = 0
+        else:
+            controller.stuck_frames = 0
+
+        controller.update_map(data["pos_x"], data["pos_y"], data["heading"], data["laser"])
+
+        if is_at_meta and not controller.finished and not controller.teleporting:
+            if not controller.fast_run:
+                if controller.run_start_time is not None:
+                    controller.exploration_duration = time.time() - controller.run_start_time
+
+                for idx in range(len(controller.exploration_path)):
+                    r, c = controller.exploration_path[idx]
+                    controller.logic_map[r][c] = 0
+                    if idx > 0:
+                        pr, pc = controller.exploration_path[idx-1]
+                        controller.logic_map[(r+pr)//2][(c+pc)//2] = 0
+                
+                gr_r, gr_c = controller.goal_cell
+                controller.logic_map[gr_r][gr_c] = 0
+                if controller.current_logic_pos:
+                    cr, cc = controller.current_logic_pos
+                    controller.logic_map[(gr_r+cr)//2][(gr_c+cc)//2] = 0
+
+                full_path = controller.compute_shortest_path((1, 1), controller.goal_cell)
+                controller.optimized_path = list(full_path[1:])
+                
+                controller.fast_run = True
+                controller.teleporting = True
+                controller.target_logic = None
+                controller.target_phys = None
+                controller.last_vx = 0.0
+                controller.last_vy = 0.0
+                
+                await ws.send(json.dumps({"cmd": "teleport_to_start"}))
+                log.info("🏁 EXPLORATION COMPLETE! Obliczanie BFS i teleportacja na start...")
+                continue
+            else:
+                if controller.fast_run_start_time is not None:
+                    controller.fast_run_duration = time.time() - controller.fast_run_start_time
+
+                if controller.benchmark_mode:
+                    controller.fast_run_times.append(controller.fast_run_duration)
+                    log.info(f"📊 [BENCHMARK] Runda {controller.current_benchmark_run}/50 zaliczona! Czas Fast Run: {controller.fast_run_duration:.3f}s")
+                    
+                    if controller.current_benchmark_run < 50:
+                        controller.current_benchmark_run += 1
+                        await ws.send(json.dumps({"cmd": "reset"}))
+                        continue
+                    else:
+                        log.info("🏆 MARATON BENCHMARK ZAKOŃCZONY! Zebrano kompletne statystyki.")
+                        controller.benchmark_mode = False
+                        controller.finished = True
+                        controller.target_logic = None
+                        controller.target_phys = None
+                        await ws.send(json.dumps({"vx": 0.0, "vy": 0.0, "w": 0.0}))
+                        continue
+                else:
+                    controller.finished = True
+                    controller.target_logic = None
+                    controller.target_phys = None
+                    controller.last_vx = 0.0
+                    controller.last_vy = 0.0
+                    await ws.send(json.dumps({"vx": 0.0, "vy": 0.0, "w": 0.0}))
+                    log.info("🏆 TRYB INDYWIDUALNY ZAKOŃCZONY SUKCESEM!")
                     continue
 
-                if "goal_cell" in data:
-                    controller.goal_cell = tuple(data["goal_cell"])
+        if controller.target_phys is not None:
+            tx, ty = controller.target_phys
+            dist_to_target = math.hypot(tx - data["pos_x"], ty - data["pos_y"])
+            if dist_to_target < 5.0:
+                if not controller.fast_run and controller.target_logic is not None:
+                    controller.exploration_path.append(controller.target_logic)
+                controller.current_logic_pos = controller.target_logic
+                controller.target_logic = None
+                controller.target_phys = None
 
-                if "maze_id" in data:
-                    if data["maze_id"] < controller.current_maze_id:
-                        continue
-                    elif data["maze_id"] > controller.current_maze_id:
-                        controller.current_maze_id = data["maze_id"]
-                        controller.reset_logic_and_maps(keep_benchmark=controller.benchmark_mode)
-                        print(f"♻️ Wykryto nowy labirynt (ID: {controller.current_maze_id}). Czyszczenie mapy...")
+        if controller.target_logic is None and not controller.finished:
+            if not controller.fast_run:
+                nl = phys_to_logic(data["pos_x"], data["pos_y"])
+                controller.current_logic_pos = nl
+            controller.update_target()
 
-                if "phys_maze" in data:
-                    controller.phys_maze_data = data["phys_maze"]
+        try:
+            cmd_from_dashboard = command_queue.get_nowait()
+            if cmd_from_dashboard == "reset":
+                await ws.send(json.dumps({"cmd": "reset"}))
+                command_queue.task_done()
+                continue
+            elif isinstance(cmd_from_dashboard, dict):
+                await ws.send(json.dumps(cmd_from_dashboard))
+                command_queue.task_done()
+                continue
+        except queue.Empty:
+            pass
 
-                is_at_meta = data.get("at_meta", False)
-                if controller.teleporting:
-                    if not is_at_meta:
-                        controller.teleporting = False
-                        controller.current_logic_pos = (1, 1)
-                        controller.stuck_frames = 0
-                        print(f"⚡ Teleportacja udana! Rozpoczynam FAST RUN dla rundy {controller.current_benchmark_run if controller.benchmark_mode else 1}...")
-                        
-                        # ZAWSZE URUCHAMIAJ STOPER DLA FAST RUN PO TELEPORTACJI
-                        controller.fast_run_start_time = time.time()
-                    else:
-                        continue
+        command = controller.get_command()
+        json_request = json.dumps(command)
+        await ws.send(json_request)
 
-                # --- STALL DETECTOR MECHANISM ----
-                if controller.target_logic is not None and not controller.finished:
-                    dist_moved = math.hypot(data["pos_x"] - controller.pos_x, data["pos_y"] - controller.pos_y)
-                    if dist_moved < 0.05:
-                        controller.stuck_frames += 1
-                    else:
-                        controller.stuck_frames = 0
+        with open("api_client.log", "a", encoding="utf-8") as log_file:
+            log_file.write(
+                f"Pos: {controller.current_logic_pos} | "
+                f"Target: {controller.target_logic} | "
+                f"REQ -> {json_request}\n"
+            )
 
-                    if controller.stuck_frames >= 20:
-                        r1, c1 = controller.current_logic_pos
-                        r2, c2 = controller.target_logic
-                        mid_r, mid_c = (r1 + r2) // 2, (c1 + c2) // 2
-                        controller.logic_map[mid_r][mid_c] = 1 
-                        if controller.target_logic in controller.visited:
-                            controller.visited.remove(controller.target_logic)
-                        if controller.path_stack:
-                            controller.path_stack.pop()
-                        controller.target_logic = None
-                        controller.target_phys = None
-                        controller.stuck_frames = 0
-                else:
-                    controller.stuck_frames = 0
 
-                controller.update_map(data["pos_x"], data["pos_y"], data["heading"], data["laser"])
+async def client_main():
+    """Main client loop with auto-reconnection on disconnect."""
+    retry_delay = 1.0
+    while True:
+        try:
+            log.info(f"Connecting to {ROBOT_WS}...")
+            async with websockets.connect(ROBOT_WS, ping_interval=None, ping_timeout=None) as ws:
+                log.info("Connected to server")
+                retry_delay = 1.0  # Reset delay on successful connection
+                await client_session(ws)
+        except websockets.exceptions.ConnectionClosed as e:
+            log.warning(f"Connection closed: {e}. Reconnecting in {retry_delay:.0f}s...")
+        except (OSError, asyncio.TimeoutError) as e:
+            log.warning(f"Connection error: {e}. Reconnecting in {retry_delay:.0f}s...")
+        except Exception as e:
+            log.error(f"Unexpected error: {e}. Reconnecting in {retry_delay:.0f}s...")
+        
+        await asyncio.sleep(retry_delay)
+        retry_delay = min(retry_delay * 1.5, 10.0)  # Exponential backoff up to 10s
 
-                if is_at_meta and not controller.finished and not controller.teleporting:
-                    if not controller.fast_run:
-                        # ZAPISZ KOŃCOWY CZAS EKSPLORACJI
-                        if controller.run_start_time is not None:
-                            controller.exploration_duration = time.time() - controller.run_start_time
 
-                        # Pieczętowanie i rekonstrukcja znanej trasy przed wywołaniem BFS
-                        for idx in range(len(controller.exploration_path)):
-                            r, c = controller.exploration_path[idx]
-                            controller.logic_map[r][c] = 0
-                            if idx > 0:
-                                pr, pc = controller.exploration_path[idx-1]
-                                controller.logic_map[(r+pr)//2][(c+pc)//2] = 0
-                        
-                        gr_r, gr_c = controller.goal_cell
-                        controller.logic_map[gr_r][gr_c] = 0
-                        if controller.current_logic_pos:
-                            cr, cc = controller.current_logic_pos
-                            controller.logic_map[(gr_r+cr)//2][(gr_c+cc)//2] = 0
+def start_client():
+    """Starts the client event loop in a daemon thread."""
+    asyncio.run(client_main())
 
-                        full_path = controller.compute_shortest_path((1, 1), controller.goal_cell)
-                        controller.optimized_path = list(full_path[1:])
-                        
-                        controller.fast_run = True
-                        controller.teleporting = True
-                        controller.target_logic = None
-                        controller.target_phys = None
-                        controller.last_vx = 0.0
-                        controller.last_vy = 0.0
-                        
-                        await ws.send(json.dumps({"cmd": "teleport_to_start"}))
-                        print("🏁 EXPLORATION COMPLETE! Obliczanie BFS i teleportacja na start...")
-                        continue
-                    else:
-                        # Meta osiągnięta w trybie Fast Run - ZAPISZ FINAŁOWY CZAS BIEGU
-                        if controller.fast_run_start_time is not None:
-                            controller.fast_run_duration = time.time() - controller.fast_run_start_time
-
-                        if controller.benchmark_mode:
-                            controller.fast_run_times.append(controller.fast_run_duration)
-                            print(f"📊 [BENCHMARK] Runda {controller.current_benchmark_run}/50 zaliczona! Czas Fast Run: {controller.fast_run_duration:.3f}s")
-                            
-                            if controller.current_benchmark_run < 50:
-                                controller.current_benchmark_run += 1
-                                await ws.send(json.dumps({"cmd": "reset"}))
-                                continue
-                            else:
-                                print("🏆 MARATON BENCHMARK ZAKOŃCZONY! Zebrano kompletne statystyki.")
-                                controller.benchmark_mode = False
-                                controller.finished = True
-                                controller.target_logic = None
-                                controller.target_phys = None
-                                await ws.send(json.dumps({"vx": 0.0, "vy": 0.0, "w": 0.0}))
-                                continue
-                        else:
-                            controller.finished = True
-                            controller.target_logic = None
-                            controller.target_phys = None
-                            controller.last_vx = 0.0
-                            controller.last_vy = 0.0
-                            await ws.send(json.dumps({"vx": 0.0, "vy": 0.0, "w": 0.0}))
-                            print("🏆 TRYB INDYWIDUALNY ZAKOŃCZONY SUKCESEM!")
-                            continue
-
-                if controller.target_phys is not None:
-                    tx, ty = controller.target_phys
-                    dist_to_target = math.hypot(tx - data["pos_x"], ty - data["pos_y"])
-                    if dist_to_target < 5.0:
-                        if not controller.fast_run and controller.target_logic is not None:
-                            controller.exploration_path.append(controller.target_logic)
-                        controller.current_logic_pos = controller.target_logic
-                        controller.target_logic = None
-                        controller.target_phys = None
-
-                if controller.target_logic is None and not controller.finished:
-                    if not controller.fast_run:
-                        nl = phys_to_logic(data["pos_x"], data["pos_y"])
-                        controller.current_logic_pos = nl
-                    controller.update_target()
-
-                try:
-                    cmd_from_dashboard = command_queue.get_nowait()
-                    if cmd_from_dashboard == "reset":
-                        await ws.send(json.dumps({"cmd": "reset"}))
-                        command_queue.task_done()
-                        continue
-                    elif isinstance(cmd_from_dashboard, dict):
-                        await ws.send(json.dumps(cmd_from_dashboard))
-                        command_queue.task_done()
-                        continue
-                except queue.Empty:
-                    pass
-
-                command = controller.get_command()
-                json_request = json.dumps(command)
-                await ws.send(json_request)
-
-                with open("api_client.log", "a", encoding="utf-8") as log_file:
-                    log_file.write(
-                        f"Pos: {controller.current_logic_pos} | "
-                        f"Target: {controller.target_logic} | "
-                        f"REQ -> {json_request}\n"
-                    )
-
-    except Exception as e:
-        print("Network Client error context:", e)
 
 if not any(t.name == "ClientWSThread" for t in threading.enumerate()):
-    threading.Thread(target=lambda: asyncio.run(client_loop()), name="ClientWSThread", daemon=True).start()
+    threading.Thread(target=start_client, name="ClientWSThread", daemon=True).start()
+    log.info("Client thread started")

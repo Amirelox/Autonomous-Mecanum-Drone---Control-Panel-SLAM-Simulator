@@ -10,7 +10,12 @@ import asyncio
 import numpy as np
 import websockets
 import os
+import logging
+from concurrent.futures import TimeoutError
 from dotenv import load_dotenv
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(threadName)s] %(levelname)s: %(message)s')
+log = logging.getLogger(__name__)
 
 load_dotenv()
 
@@ -53,11 +58,17 @@ for r in range(2 * N + 1):
             x_end = x_start + (PATH_WIDTH if c % 2 != 0 else WALL_THICK)
             phys_maze[y_start:y_end, x_start:x_end] = 1
 
+# Thread lock for all shared state between physics loop and WebSocket handler
+state_lock = threading.Lock()
+
 # Setup control telemetry parameters
 cmd_vx, cmd_vy, cmd_w = 0.0, 0.0, 0.0
 last_cmd_time = time.time()
 robot_armed = False
 current_maze_id = 1  # Wersjonowanie sesji labiryntu
+
+# Flag to pause physics during reset
+physics_paused = False
 
 # --- DZIEŃ 1: DYNAMICZNE USTAWIANIE METS I PRĘDKOŚCI SYMULACJI ---
 SIM_SPEED = 1.0
@@ -103,7 +114,24 @@ def is_collision(x, y):
 # WEBSOCKET SERVER SECURITY & COMMUNICATIONS
 # ============================================================
 KEY_HEX = os.getenv("ROBOT_HMAC_KEY")
-clients, server_loop = set(), None
+clients = set()
+server_loop = None
+
+def broadcast_message(msg_dict):
+    """Thread-safe broadcast to all connected WebSocket clients."""
+    global server_loop
+    if not clients or not server_loop:
+        return
+    msg = json.dumps(msg_dict)
+    loop = server_loop
+    for ws in list(clients):
+        try:
+            asyncio.run_coroutine_threadsafe(ws.send(msg), loop).result(timeout=1.0)
+        except (TimeoutError, ConnectionResetError, websockets.exceptions.ConnectionClosed):
+            clients.discard(ws)
+        except Exception as e:
+            log.warning(f"Broadcast error: {e}")
+            clients.discard(ws)
 
 async def handle_client(websocket):
     global cmd_vx, cmd_vy, cmd_w, last_cmd_time, robot_armed, robot_x, robot_y, robot_heading, current_maze_id, SIM_SPEED, META_PLACEMENT
@@ -113,41 +141,69 @@ async def handle_client(websocket):
         await websocket.send(json.dumps({"nonce": nonce}))
         auth_data = json.loads(await asyncio.wait_for(websocket.recv(), 5.0))
         if not hmac.compare_digest(auth_data.get("auth", ""), hmac.new(bytes.fromhex(KEY_HEX), bytes.fromhex(nonce), hashlib.sha256).hexdigest()):
+            log.warning("Auth failed — closing connection")
             return
         await websocket.send(json.dumps({"auth": "ok"}))
         clients.add(websocket)
+        
+        with state_lock:
+            initial_maze = phys_maze.tolist()
+            initial_maze_id = current_maze_id
+            initial_goal = goal_logic
+        
+        await websocket.send(json.dumps({
+            "phys_maze": initial_maze,
+            "maze_id": initial_maze_id,
+            "goal_cell": initial_goal
+        }))
+        log.info(f"Client connected ({len(clients)} total)")
         
         async for msg in websocket:
             try:
                 data = json.loads(msg)
 
                 if data.get("cmd") == "reset":
+                    log.info("Received reset command")
                     reset_entire_simulation()
                     continue
 
                 if data.get("cmd") == "teleport_to_start":
-                    cmd_vx, cmd_vy, cmd_w = 0.0, 0.0, 0.0
-                    robot_x, robot_y = start_x, start_y
-                    robot_heading = 0.0
-                    print("⚡ [SERWER] Teleportacja drona na blok startowy wykonana!")
+                    with state_lock:
+                        cmd_vx, cmd_vy, cmd_w = 0.0, 0.0, 0.0
+                        robot_x, robot_y = start_x, start_y
+                        robot_heading = 0.0
+                    log.info("Teleportacja drona na blok startowy wykonana!")
                     continue
 
                 # --- OBSŁUGA DYNAMICZNYCH USTAWIEŃ Z DASHBOARDU ---
                 if data.get("cmd") == "set_speed":
-                    SIM_SPEED = float(data.get("value", 1.0))
+                    with state_lock:
+                        SIM_SPEED = float(data.get("value", 1.0))
                     continue
 
                 if data.get("cmd") == "set_meta":
-                    META_PLACEMENT = data.get("value", "corner")
-                    update_goal_coordinates()
+                    with state_lock:
+                        META_PLACEMENT = data.get("value", "corner")
+                        update_goal_coordinates()
                     continue
 
-                cmd_vx, cmd_vy, cmd_w = data.get("vx", 0.0), data.get("vy", 0.0), data.get("w", 0.0)
-                robot_armed = True
-                last_cmd_time = time.time()
-            except: pass
-    except: pass
-    finally: clients.discard(websocket)
+                with state_lock:
+                    cmd_vx, cmd_vy, cmd_w = data.get("vx", 0.0), data.get("vy", 0.0), data.get("w", 0.0)
+                    robot_armed = True
+                    last_cmd_time = time.time()
+            except json.JSONDecodeError:
+                log.warning("Invalid JSON from client")
+            except Exception as e:
+                log.error(f"Error processing message: {e}")
+    except asyncio.TimeoutError:
+        log.warning("Client auth timeout")
+    except websockets.exceptions.ConnectionClosed:
+        log.info("Client disconnected normally")
+    except Exception as e:
+        log.error(f"Client handler error: {e}")
+    finally:
+        clients.discard(websocket)
+        log.info(f"Client removed ({len(clients)} remaining)")
 
 def start_ws():
     global server_loop
@@ -163,93 +219,130 @@ threading.Thread(target=start_ws, daemon=True).start()
 
 def reset_entire_simulation():
     """Wipes current track, builds a new randomized maze topology and forces an immediate telemetry broadcast."""
-    global logic_maze, phys_maze, robot_x, robot_y, robot_heading, robot_armed, current_maze_id
+    global logic_maze, phys_maze, phys_h, phys_w, robot_x, robot_y, robot_heading, robot_armed, current_maze_id
     from config import M, N, CELL_SIZE, WALL_THICK, PATH_WIDTH, NUM_SENSORS, RAYS_PER_SENSOR, SENSOR_RANGE
     
-    current_maze_id += 1  
-    logic_maze = generate_maze_no_loops(M, N)
-    update_goal_coordinates()
-    
-    new_phys_h = N * CELL_SIZE + WALL_THICK
-    new_phys_w = M * CELL_SIZE + WALL_THICK
-    phys_maze = np.zeros((new_phys_h, new_phys_w))
-    
-    for r in range(2 * N + 1):
-        for c in range(2 * M + 1):
-            if logic_maze[r][c] == 1:
-                y_start = (r // 2) * CELL_SIZE + (WALL_THICK if r % 2 != 0 else 0)
-                y_end = y_start + (PATH_WIDTH if r % 2 != 0 else WALL_THICK)
-                x_start = (c // 2) * CELL_SIZE + (WALL_THICK if c % 2 != 0 else 0)
-                x_end = x_start + (PATH_WIDTH if c % 2 != 0 else WALL_THICK)
-                phys_maze[y_start:y_end, x_start:x_end] = 1
-                
-    robot_x, robot_y = start_x, start_y
-    robot_heading = 0.0
-    robot_armed = False
-    print(f"♻️ Server generated a new track (ID: {current_maze_id}) with meta at {META_PLACEMENT}!")
-
-    if clients and server_loop:
-        at_meta = False
-        total_rays = int(NUM_SENSORS * RAYS_PER_SENSOR)
-        dummy_laser = [{"d": float(SENSOR_RANGE), "hit": False} for _ in range(total_rays)]
+    with state_lock:
+        global physics_paused
+        physics_paused = True
         
-        msg = json.dumps({
-            "pos_x": robot_x, "pos_y": robot_y, "heading": robot_heading, 
-            "laser": dummy_laser, "at_meta": at_meta, "phys_maze": phys_maze.tolist(),
-            "maze_id": current_maze_id, "goal_cell": goal_logic
-        })
-        for ws in list(clients):
-            asyncio.run_coroutine_threadsafe(ws.send(msg), server_loop)
+        current_maze_id += 1  
+        logic_maze = generate_maze_no_loops(M, N)
+        update_goal_coordinates()
+        
+        phys_h = N * CELL_SIZE + WALL_THICK
+        phys_w = M * CELL_SIZE + WALL_THICK
+        phys_maze = np.zeros((phys_h, phys_w))
+        
+        for r in range(2 * N + 1):
+            for c in range(2 * M + 1):
+                if logic_maze[r][c] == 1:
+                    y_start = (r // 2) * CELL_SIZE + (WALL_THICK if r % 2 != 0 else 0)
+                    y_end = y_start + (PATH_WIDTH if r % 2 != 0 else WALL_THICK)
+                    x_start = (c // 2) * CELL_SIZE + (WALL_THICK if c % 2 != 0 else 0)
+                    x_end = x_start + (PATH_WIDTH if c % 2 != 0 else WALL_THICK)
+                    phys_maze[y_start:y_end, x_start:x_end] = 1
+                    
+        robot_x, robot_y = start_x, start_y
+        robot_heading = 0.0
+        robot_armed = False
+        
+        physics_paused = False
+    
+    log.info(f"♻️ Server generated a new track (ID: {current_maze_id}) with meta at {META_PLACEMENT}!")
+
+    # Broadcast reset notification to all clients
+    broadcast_message({
+        "pos_x": robot_x, "pos_y": robot_y, "heading": robot_heading, 
+        "laser": [{"d": float(SENSOR_RANGE), "hit": False} for _ in range(int(NUM_SENSORS * RAYS_PER_SENSOR))],
+        "at_meta": bool(math.hypot(robot_x - goal_x, robot_y - goal_y) < 15.0),
+        "maze_id": current_maze_id, "goal_cell": goal_logic,
+        "phys_maze": phys_maze.tolist()
+    })
             
 # ============================================================
 # SIMULATOR KINEMATICS ENGINE LOOP
 # ============================================================
 async def physics_loop():
-    global robot_x, robot_y, robot_heading, robot_armed, current_maze_id
+    global robot_x, robot_y, robot_heading, robot_armed
     while True:
-        if time.time() - last_cmd_time > 0.5:
-            robot_armed = False
+        with state_lock:
+            local_paused = physics_paused
+            local_armed = robot_armed
+            local_heading = robot_heading
+            local_vx = cmd_vx
+            local_vy = cmd_vy
+            local_w = cmd_w
+            local_last_cmd = last_cmd_time
+            local_sim_speed = SIM_SPEED
 
-        if robot_armed:
-            robot_heading += cmd_w * 0.1
-            g_vx = cmd_vx * math.cos(robot_heading) - cmd_vy * math.sin(robot_heading)
-            g_vy = cmd_vx * math.sin(robot_heading) + cmd_vy * math.cos(robot_heading)
-            if not is_collision(robot_x + g_vx * ROBOT_SPEED_SCALE, robot_y): robot_x += g_vx * ROBOT_SPEED_SCALE
-            if not is_collision(robot_x, robot_y + g_vy * ROBOT_SPEED_SCALE): robot_y += g_vy * ROBOT_SPEED_SCALE
+        if not local_paused:
+            if time.time() - local_last_cmd > 0.5:
+                with state_lock:
+                    robot_armed = False
+                local_armed = False
 
-        all_hits = []
-        for i in range(NUM_SENSORS):
-            s_hdg = math.radians(math.degrees(robot_heading) + SENSOR_ANGLES_DEG[i])
-            sx = robot_x + SENSOR_RADIUS * math.cos(s_hdg)
-            sy = robot_y + SENSOR_RADIUS * math.sin(s_hdg)
-            
-            for ang in ray_angles_deg:
-                r_ang = s_hdg + math.radians(ang)
-                dx, dy = math.cos(r_ang), math.sin(r_ang)
-                dist, hit = SENSOR_RANGE + random.gauss(0, NOISE_STD), False
+            if local_armed:
+                new_heading = local_heading + local_w * 0.1
+                g_vx = local_vx * math.cos(new_heading) - local_vy * math.sin(new_heading)
+                g_vy = local_vx * math.sin(new_heading) + local_vy * math.cos(new_heading)
                 
-                for d in range(1, int(dist)):
-                    cx, cy = int(sx + dx*d), int(sy + dy*d)
-                    if 0 <= cy < phys_h and 0 <= cx < phys_w:
-                        if phys_maze[cy, cx] == 1:
-                            dist, hit = d + random.gauss(0, NOISE_STD), True
+                with state_lock:
+                    if not is_collision(robot_x + g_vx * ROBOT_SPEED_SCALE, robot_y):
+                        robot_x += g_vx * ROBOT_SPEED_SCALE
+                    if not is_collision(robot_x, robot_y + g_vy * ROBOT_SPEED_SCALE):
+                        robot_y += g_vy * ROBOT_SPEED_SCALE
+                    robot_heading = new_heading
+
+            # Snapshot shared state for broadcast under lock
+            with state_lock:
+                snap_x = robot_x
+                snap_y = robot_y
+                snap_heading = robot_heading
+                snap_maze = phys_maze
+                snap_h = phys_h
+                snap_w = phys_w
+                snap_maze_id = current_maze_id
+                snap_goal_x = goal_x
+                snap_goal_y = goal_y
+                snap_goal_logic = goal_logic
+
+            # Optimized laser ray calculation using numpy where possible
+            all_hits = []
+            for i in range(NUM_SENSORS):
+                s_hdg = math.radians(math.degrees(snap_heading) + SENSOR_ANGLES_DEG[i])
+                sx = snap_x + SENSOR_RADIUS * math.cos(s_hdg)
+                sy = snap_y + SENSOR_RADIUS * math.sin(s_hdg)
+                
+                for ang in ray_angles_deg:
+                    r_ang = s_hdg + math.radians(ang)
+                    dx, dy = math.cos(r_ang), math.sin(r_ang)
+                    dist, hit = float(SENSOR_RANGE + random.gauss(0, NOISE_STD)), False
+                    
+                    # Ray march with early exit on wall hit
+                    max_steps = min(int(dist), SENSOR_RANGE)
+                    for d in range(1, max_steps):
+                        cx = int(sx + dx * d)
+                        cy = int(sy + dy * d)
+                        if 0 <= cy < snap_h and 0 <= cx < snap_w:
+                            if snap_maze[cy, cx] == 1:
+                                dist = float(d + random.gauss(0, NOISE_STD))
+                                hit = True
+                                break
+                        else:
                             break
-                    else: break
-                
-                all_hits.append({"d": dist, "hit": hit})
+                    
+                    all_hits.append({"d": max(1.0, dist), "hit": hit})
 
-        if clients and server_loop:
-            at_meta = bool(math.hypot(robot_x - goal_x, robot_y - goal_y) < 15.0)
-            msg = json.dumps({
-                "pos_x": robot_x, "pos_y": robot_y, "heading": robot_heading, 
-                "laser": all_hits, "at_meta": at_meta, "phys_maze": phys_maze.tolist(),
-                "maze_id": current_maze_id, "goal_cell": goal_logic
+            at_meta = bool(math.hypot(snap_x - snap_goal_x, snap_y - snap_goal_y) < 15.0)
+            broadcast_message({
+                "pos_x": snap_x, "pos_y": snap_y, "heading": snap_heading,
+                "laser": all_hits, "at_meta": at_meta,
+                "phys_maze": snap_maze.tolist(),
+                "maze_id": snap_maze_id, "goal_cell": snap_goal_logic
             })
-            for ws in list(clients):
-                asyncio.run_coroutine_threadsafe(ws.send(msg), server_loop)
-                
-        # --- ZASTĄPIENIE STAŁEGO OPÓŹNIENIA ZMIENNĄ DYNAMICZNĄ ---
-        await asyncio.sleep(0.06 / max(0.1, SIM_SPEED))
+
+        await asyncio.sleep(0.06 / max(0.1, local_sim_speed))
 
 def start_physics():
     loop = asyncio.new_event_loop()
