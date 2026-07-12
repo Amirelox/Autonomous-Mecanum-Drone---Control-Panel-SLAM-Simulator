@@ -3,6 +3,7 @@ import json
 import numpy as np
 import cv2
 import math
+import time as tm # Dodany import czystego modułu czasu do pomiarów live
 from streamlit_autorefresh import st_autorefresh
 
 # Safely bridge into localized thread contexts
@@ -16,7 +17,31 @@ st_autorefresh(interval=100, limit=100000, key="frameratesetter")
 if "dfs_running" not in st.session_state:
     st.session_state.dfs_running = False
 
+# --- ZAPOBIEGANIE SPAMOWANIU KOLEJKI POLECEŃ SIECIOWYCH ---
+if "last_sim_speed" not in st.session_state:
+    st.session_state.last_sim_speed = 1.0
+if "last_meta_placement" not in st.session_state:
+    st.session_state.last_meta_placement = "Narożnik"
+
 st.title("🛸 Autonomous Mecanum Drone - Operations Dashboard")
+
+# ============================================================
+# BOCZNY PANEL KONFIGURACJI ŚRODOWISKA (SIDEBAR)
+# ============================================================
+st.sidebar.header("⚙️ Parametry Środowiska")
+sim_speed = st.sidebar.slider("Prędkość symulacji (SIM_SPEED)", 1.0, 10.0, st.session_state.last_sim_speed, step=0.5)
+meta_placement = st.sidebar.selectbox("Pozycja mety", ["Narożnik", "Środek"], index=0 if st.session_state.last_meta_placement == "Narożnik" else 1)
+
+if sim_speed != st.session_state.last_sim_speed:
+    st.session_state.last_sim_speed = sim_speed
+    from client import command_queue
+    command_queue.put({"cmd": "set_speed", "value": sim_speed})
+
+if meta_placement != st.session_state.last_meta_placement:
+    st.session_state.last_meta_placement = meta_placement
+    from client import command_queue
+    command_queue.put({"cmd": "set_meta", "value": "corner" if meta_placement == "Narożnik" else "center"})
+
 DISPLAY_SIZE = (450, 450)
 
 def reset_explorer():
@@ -39,6 +64,17 @@ def reset_explorer():
     controller.target_phys = None
     controller.stuck_frames = 0
     controller.current_logic_pos = (1, 1)
+    
+    controller.fast_run = False
+    controller.teleporting = False
+    controller.optimized_path = []
+    controller.exploration_path = [(1, 1)]
+    
+    # RESET INDYWIDUALNYCH STOPERÓW W PANELU
+    controller.run_start_time = None
+    controller.exploration_duration = 0.0
+    controller.fast_run_duration = 0.0
+    controller.fast_run_start_time = None
     
     start_x_phys = float(WALL_THICK + PATH_WIDTH / 2)
     start_y_phys = float(WALL_THICK + PATH_WIDTH / 2)
@@ -66,17 +102,14 @@ with col1:
         img_real[real_maze == 0] = [38, 38, 38]   
         img_real[real_maze == 1] = [255, 255, 255] 
         
-        # Plot Goal Target: Render red rectangle at track end boundary
         g_size = int(ROBOT_W_WIDTH)
-        goal_x_pixels = img_real.shape[1] - 16
-        goal_y_pixels = img_real.shape[0] - 16
+        gx_phys, gy_phys = client.logic_to_phys(controller.goal_cell[0], controller.goal_cell[1])
         
         cv2.rectangle(img_real, 
-                      (int(goal_x_pixels - g_size//2), int(goal_y_pixels - g_size//2)), 
-                      (int(goal_x_pixels + g_size//2), int(goal_y_pixels + g_size//2)), 
+                      (int(gx_phys - g_size//2), int(gy_phys - g_size//2)), 
+                      (int(gx_phys + g_size//2), int(gy_phys + g_size//2)), 
                       (255, 0, 0), -1)
         
-        # Render live LiDAR sensor beam arrays
         if hasattr(controller, 'laser_data') and controller.laser_data:
             from client import NUM_SENSORS, RAYS_PER_SENSOR, SENSOR_ANGLES_DEG, SENSOR_RADIUS, ray_angles_deg
             idx = 0
@@ -92,7 +125,6 @@ with col1:
                     cv2.line(img_real, (int(sx), int(sy)), (ex, ey), (255, 50, 50), 1)
                     idx += 1
         
-        # Render Blue Rectangle Drone footprint
         rx, ry = int(controller.pos_x), int(controller.pos_y)
         rw = int(ROBOT_W_WIDTH)
         rl = int(ROBOT_L_LENGTH)
@@ -111,7 +143,6 @@ with col1:
 with col2:
     st.header("🗺️ Client - SLAM Grid Map")
     
-    # Process probabilisitic matrix map to RGB grayscale spectrums
     img_gray = (1.0 - client.prob_map) * 255
     img_gray = np.clip(img_gray, 0, 255).astype(np.uint8)
     img_rgb = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2RGB)
@@ -126,7 +157,6 @@ with col2:
                       (rx + rw//2, ry + rl//2), 
                       (30, 144, 255), -1)
         
-    # Crop bounds dynamically to lock an elegant Auto-Zoom view window
     margin = 60
     min_x = max(0, int(controller.min_seen_x - margin))
     max_x = min(client.PHYS_W, int(controller.max_seen_x + margin)) 
@@ -157,18 +187,69 @@ with col_ctrl:
         controller.last_vx = 0.0
         controller.last_vy = 0.0
         
+        # AKTUALIZACJA: Wymuszenie startu stopera głównego przejazdu
+        controller.run_start_time = tm.time()
+        controller.exploration_duration = 0.0
+        controller.fast_run_duration = 0.0
+        controller.fast_run_start_time = None
+        
         controller.update_target()
         st.success("DFS Solver Activated")
         
+    if st.button("📊 START BENCHMARK MODE (50 RUNS)", use_container_width=True):
+        controller.benchmark_mode = True
+        controller.current_benchmark_run = 1
+        controller.fast_run_times = []
+        
+        # AKTUALIZACJA: Wsparcie stopera również dla startu maratonu
+        controller.run_start_time = tm.time()
+        controller.exploration_duration = 0.0
+        controller.fast_run_duration = 0.0
+        
+        controller.reset_logic_and_maps(keep_benchmark=True)
+        from client import command_queue
+        command_queue.put("reset")
+        st.success("Zainicjalizowano Tryb Benchmarku. Rozpoczynam maraton 50 labiryntów...")
+
     if st.button("🛑 STOP / EMERGENCY", type="primary", use_container_width=True):
         st.session_state.dfs_running = False
         controller.finished = True
+        controller.benchmark_mode = False
         st.warning("E-Stop Engaged")
 
     if st.button("🔄 GENERATE NEW MAZE & RESET LOGIC", use_container_width=True):
         controller.phys_maze_data = None 
         reset_explorer()
         st.info("Ecosystem re-generated. New maze is active!")
+
+    # ============================================================
+    # NOWOŚĆ: MODUŁ STOPERA LIVE DLA PRZEJAZDÓW INDYWIDUALNYCH
+    # ============================================================
+    st.markdown("---")
+    st.subheader("⏱️ Chronometr Przejazdu")
+    
+    if not controller.finished:
+        if not controller.fast_run:
+            # Faza Eksploracji trwa - licznik bije live
+            if getattr(controller, 'run_start_time', None) is not None:
+                elapsed_expl = tm.time() - controller.run_start_time
+                st.metric(label="🔍 Eksploracja DFS (LIVE)", value=f"{elapsed_expl:.2f} s")
+            else:
+                st.metric(label="🔍 Eksploracja DFS", value="0.00 s")
+        else:
+            # Faza Fast Run trwa - licznik bije live
+            if getattr(controller, 'fast_run_start_time', None) is not None:
+                elapsed_fast = tm.time() - controller.fast_run_start_time
+                st.metric(label="⚡ Bieg Finałowy (LIVE)", value=f"{elapsed_fast:.2f} s")
+            else:
+                st.metric(label="⚡ Bieg Finałowy", value="0.00 s")
+    else:
+        # Przejazd zatrzymany lub zakończony - zamrażamy i pokazujemy ostatnie zapisane wyniki
+        t_col1, t_col2 = st.columns(2)
+        with t_col1:
+            st.metric(label="🏁 Ostatni DFS", value=f"{getattr(controller, 'exploration_duration', 0.0):.2f} s")
+        with t_col2:
+            st.metric(label="🏆 Ostatni Fast Run", value=f"{getattr(controller, 'fast_run_duration', 0.0):.2f} s")
 
 with col_api:
     st.subheader("💻 Manual Mecanum JSON API Console")
@@ -183,3 +264,29 @@ with col_api:
             st.success("Payload sent to control register")
         except json.JSONDecodeError:
             st.error("Invalid JSON syntax provided")
+
+# ============================================================
+# LIVE BENCHMARK MODE STATISTICS DISPLAY
+# ============================================================
+if controller.benchmark_mode or controller.fast_run_times:
+    st.markdown("---")
+    st.header("📈 Maraton Wyników – Analityka Statystyczna")
+    
+    progress = len(controller.fast_run_times)
+    st.write(f"**Postęp maratonu:** Zrealizowano **{progress} z 50** pełnych cykli przejazdów.")
+    
+    if controller.fast_run_times:
+        times = controller.fast_run_times
+        
+        m_col1, m_col2, m_col3, m_col4 = st.columns(4)
+        with m_col1:
+            st.metric(label="Średni czas Fast Run", value=f"{np.mean(times):.3f} s")
+        with m_col2:
+            st.metric(label="🚀 Najszybszy (Min)", value=f"{np.min(times):.3f} s")
+        with m_col3:
+            st.metric(label="🐢 Najwolniejszy (Max)", value=f"{np.max(times):.3f} s")
+        with m_col4:
+            st.metric(label="📉 Odchylenie std (σ)", value=f"{np.std(times):.3f} s")
+            
+        st.subheader("Wykres dystrybucji czasów w kolejnych próbach")
+        st.line_chart(times)

@@ -57,10 +57,28 @@ for r in range(2 * N + 1):
 cmd_vx, cmd_vy, cmd_w = 0.0, 0.0, 0.0
 last_cmd_time = time.time()
 robot_armed = False
+current_maze_id = 1  # Wersjonowanie sesji labiryntu
 
-# Compute start coordinates and endpoint (goal) target markers
+# --- DZIEŃ 1: DYNAMICZNE USTAWIANIE METS I PRĘDKOŚCI SYMULACJI ---
+SIM_SPEED = 1.0
+META_PLACEMENT = "corner" # "corner" lub "center"
+
 start_x, start_y = float(WALL_THICK + PATH_WIDTH / 2), float(WALL_THICK + PATH_WIDTH / 2)
-goal_x, goal_y = float((M-1) * CELL_SIZE + WALL_THICK + PATH_WIDTH / 2), float((N-1) * CELL_SIZE + WALL_THICK + PATH_WIDTH / 2)
+goal_x, goal_y = 0.0, 0.0
+goal_logic = (0, 0)
+
+def update_goal_coordinates():
+    global goal_x, goal_y, goal_logic
+    if META_PLACEMENT == "corner":
+        goal_logic = (2 * (N - 1) + 1, 2 * (M - 1) + 1)
+        goal_x = float((M-1) * CELL_SIZE + WALL_THICK + PATH_WIDTH / 2)
+        goal_y = float((N-1) * CELL_SIZE + WALL_THICK + PATH_WIDTH / 2)
+    else: # "center"
+        goal_logic = (2 * (N // 2) + 1, 2 * (M // 2) + 1)
+        goal_x = float((M // 2) * CELL_SIZE + WALL_THICK + PATH_WIDTH / 2)
+        goal_y = float((N // 2) * CELL_SIZE + WALL_THICK + PATH_WIDTH / 2)
+
+update_goal_coordinates()
 robot_x, robot_y, robot_heading = start_x, start_y, 0.0
 ROBOT_SPEED_SCALE = 3.0 
 
@@ -88,7 +106,7 @@ KEY_HEX = os.getenv("ROBOT_HMAC_KEY")
 clients, server_loop = set(), None
 
 async def handle_client(websocket):
-    global cmd_vx, cmd_vy, cmd_w, last_cmd_time, robot_armed
+    global cmd_vx, cmd_vy, cmd_w, last_cmd_time, robot_armed, robot_x, robot_y, robot_heading, current_maze_id, SIM_SPEED, META_PLACEMENT
     try:
         # Secure HMAC-SHA256 handshake verification
         nonce = hex(random.getrandbits(128))[2:].zfill(32)
@@ -103,9 +121,25 @@ async def handle_client(websocket):
             try:
                 data = json.loads(msg)
 
-                # Process system reset request from the HMI dashboard
                 if data.get("cmd") == "reset":
                     reset_entire_simulation()
+                    continue
+
+                if data.get("cmd") == "teleport_to_start":
+                    cmd_vx, cmd_vy, cmd_w = 0.0, 0.0, 0.0
+                    robot_x, robot_y = start_x, start_y
+                    robot_heading = 0.0
+                    print("⚡ [SERWER] Teleportacja drona na blok startowy wykonana!")
+                    continue
+
+                # --- OBSŁUGA DYNAMICZNYCH USTAWIEŃ Z DASHBOARDU ---
+                if data.get("cmd") == "set_speed":
+                    SIM_SPEED = float(data.get("value", 1.0))
+                    continue
+
+                if data.get("cmd") == "set_meta":
+                    META_PLACEMENT = data.get("value", "corner")
+                    update_goal_coordinates()
                     continue
 
                 cmd_vx, cmd_vy, cmd_w = data.get("vx", 0.0), data.get("vy", 0.0), data.get("w", 0.0)
@@ -129,18 +163,17 @@ threading.Thread(target=start_ws, daemon=True).start()
 
 def reset_entire_simulation():
     """Wipes current track, builds a new randomized maze topology and forces an immediate telemetry broadcast."""
-    global logic_maze, phys_maze, robot_x, robot_y, robot_heading, robot_armed
+    global logic_maze, phys_maze, robot_x, robot_y, robot_heading, robot_armed, current_maze_id
     from config import M, N, CELL_SIZE, WALL_THICK, PATH_WIDTH, NUM_SENSORS, RAYS_PER_SENSOR, SENSOR_RANGE
     
-    # 1. Generate new logical matrix
+    current_maze_id += 1  
     logic_maze = generate_maze_no_loops(M, N)
+    update_goal_coordinates()
     
-    # 2. Compute new physical boundaries and clean the grid
     new_phys_h = N * CELL_SIZE + WALL_THICK
     new_phys_w = M * CELL_SIZE + WALL_THICK
     phys_maze = np.zeros((new_phys_h, new_phys_w))
     
-    # 3. Build physical walls
     for r in range(2 * N + 1):
         for c in range(2 * M + 1):
             if logic_maze[r][c] == 1:
@@ -150,13 +183,11 @@ def reset_entire_simulation():
                 x_end = x_start + (PATH_WIDTH if c % 2 != 0 else WALL_THICK)
                 phys_maze[y_start:y_end, x_start:x_end] = 1
                 
-    # 4. Teleport drone back to starting location and cut motors
     robot_x, robot_y = start_x, start_y
     robot_heading = 0.0
     robot_armed = False
-    print("♻️ Server generated a new track and reset drone coordinates successfully!")
+    print(f"♻️ Server generated a new track (ID: {current_maze_id}) with meta at {META_PLACEMENT}!")
 
-    # 5. Force an immediate network sync frame to all connected dashboards
     if clients and server_loop:
         at_meta = False
         total_rays = int(NUM_SENSORS * RAYS_PER_SENSOR)
@@ -164,7 +195,8 @@ def reset_entire_simulation():
         
         msg = json.dumps({
             "pos_x": robot_x, "pos_y": robot_y, "heading": robot_heading, 
-            "laser": dummy_laser, "at_meta": at_meta, "phys_maze": phys_maze.tolist()
+            "laser": dummy_laser, "at_meta": at_meta, "phys_maze": phys_maze.tolist(),
+            "maze_id": current_maze_id, "goal_cell": goal_logic
         })
         for ws in list(clients):
             asyncio.run_coroutine_threadsafe(ws.send(msg), server_loop)
@@ -173,9 +205,8 @@ def reset_entire_simulation():
 # SIMULATOR KINEMATICS ENGINE LOOP
 # ============================================================
 async def physics_loop():
-    global robot_x, robot_y, robot_heading, robot_armed
+    global robot_x, robot_y, robot_heading, robot_armed, current_maze_id
     while True:
-        # Watchdog: failsafe timeout drops arming if network heartbeat flatlines
         if time.time() - last_cmd_time > 0.5:
             robot_armed = False
 
@@ -186,7 +217,6 @@ async def physics_loop():
             if not is_collision(robot_x + g_vx * ROBOT_SPEED_SCALE, robot_y): robot_x += g_vx * ROBOT_SPEED_SCALE
             if not is_collision(robot_x, robot_y + g_vy * ROBOT_SPEED_SCALE): robot_y += g_vy * ROBOT_SPEED_SCALE
 
-        # Calculate laser sensor ray vectors via iterative wall boundaries checking
         all_hits = []
         for i in range(NUM_SENSORS):
             s_hdg = math.radians(math.degrees(robot_heading) + SENSOR_ANGLES_DEG[i])
@@ -208,17 +238,18 @@ async def physics_loop():
                 
                 all_hits.append({"d": dist, "hit": hit})
 
-        # Broadcast telemetry payload out to open clients
         if clients and server_loop:
             at_meta = bool(math.hypot(robot_x - goal_x, robot_y - goal_y) < 15.0)
             msg = json.dumps({
                 "pos_x": robot_x, "pos_y": robot_y, "heading": robot_heading, 
-                "laser": all_hits, "at_meta": at_meta, "phys_maze": phys_maze.tolist()
+                "laser": all_hits, "at_meta": at_meta, "phys_maze": phys_maze.tolist(),
+                "maze_id": current_maze_id, "goal_cell": goal_logic
             })
             for ws in list(clients):
                 asyncio.run_coroutine_threadsafe(ws.send(msg), server_loop)
                 
-        await asyncio.sleep(0.06)
+        # --- ZASTĄPIENIE STAŁEGO OPÓŹNIENIA ZMIENNĄ DYNAMICZNĄ ---
+        await asyncio.sleep(0.06 / max(0.1, SIM_SPEED))
 
 def start_physics():
     loop = asyncio.new_event_loop()
@@ -227,6 +258,5 @@ def start_physics():
 
 threading.Thread(target=start_physics, daemon=True).start()
 
-# Keep script process alive
 while True:
     time.sleep(1)
