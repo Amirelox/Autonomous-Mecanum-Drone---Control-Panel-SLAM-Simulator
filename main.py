@@ -26,7 +26,11 @@ from config import (
     SENSOR_RANGE, NOISE_STD, NUM_SENSORS, 
     RAYS_PER_SENSOR, SENSOR_ANGLES_DEG, ray_angles_deg,
     # Pre-computed radians for fast ray marching
-    SENSOR_ANGLES_RAD, ray_angles_rad
+    SENSOR_ANGLES_RAD, ray_angles_rad,
+    # Physics & dynamics
+    ROBOT_MASS, MAX_MOTOR_FORCE, DRAG_COEFF,
+    MAX_GRIP, MAX_SPEED,
+    ODOMETRY_NOISE_STD, GYRO_DRIFT_STD, ODOMETRY_DRIFT_RATE
 )
 
 def generate_maze_no_loops(width, height):
@@ -93,7 +97,17 @@ def update_goal_coordinates():
 
 update_goal_coordinates()
 robot_x, robot_y, robot_heading = start_x, start_y, 0.0
-ROBOT_SPEED_SCALE = 3.0 
+
+# 🏎️ EV DYNAMICS STATE
+robot_vx = 0.0                # global velocity x (units/s)
+robot_vy = 0.0                # global velocity y (units/s)
+is_skidding = False
+
+# 📡 NOISY ODOMETRY (sent to client, diverges from true position)
+odometry_x = start_x
+odometry_y = start_y
+odometry_heading = 0.0
+total_distance = 0.0           # cumulative distance for drift calc
 
 def is_collision(x, y):
     """Validates the rectangular footprint corners of the drone against wall boundaries."""
@@ -231,6 +245,7 @@ threading.Thread(target=start_ws, daemon=True).start()
 def reset_entire_simulation():
     """Wipes current track, builds a new randomized maze topology and forces an immediate telemetry broadcast."""
     global logic_maze, phys_maze, phys_h, phys_w, robot_x, robot_y, robot_heading, robot_armed, current_maze_id
+    global robot_vx, robot_vy, is_skidding, odometry_x, odometry_y, odometry_heading, total_distance
     from config import M, N, CELL_SIZE, WALL_THICK, PATH_WIDTH, NUM_SENSORS, RAYS_PER_SENSOR, SENSOR_RANGE
     
     with state_lock:
@@ -257,6 +272,12 @@ def reset_entire_simulation():
         robot_x, robot_y = start_x, start_y
         robot_heading = 0.0
         robot_armed = False
+        robot_vx = 0.0
+        robot_vy = 0.0
+        is_skidding = False
+        odometry_x, odometry_y = start_x, start_y
+        odometry_heading = 0.0
+        total_distance = 0.0
         
         physics_paused = False
     
@@ -268,15 +289,21 @@ def reset_entire_simulation():
         "laser": [{"d": float(SENSOR_RANGE), "hit": False} for _ in range(int(NUM_SENSORS * RAYS_PER_SENSOR))],
         "at_meta": bool(math.hypot(robot_x - goal_x, robot_y - goal_y) < 15.0),
         "maze_id": current_maze_id, "goal_cell": goal_logic,
-        "phys_maze": phys_maze.tolist()
+        "phys_maze": phys_maze.tolist(),
+        "is_skidding": False,
+        "true_x": robot_x, "true_y": robot_y
     })
             
 # ============================================================
-# SIMULATOR KINEMATICS ENGINE LOOP
+# SIMULATOR KINEMATICS ENGINE LOOP (🏎️ EV Dynamics)
 # ============================================================
 async def physics_loop():
     global robot_x, robot_y, robot_heading, robot_armed
+    global robot_vx, robot_vy, is_skidding
+    global odometry_x, odometry_y, odometry_heading, total_distance
     idle_heartbeat = 0.0
+    last_tick = time.time()
+    
     while True:
         with state_lock:
             local_paused = physics_paused
@@ -289,6 +316,8 @@ async def physics_loop():
             local_sim_speed = SIM_SPEED
 
         now = time.time()
+        dt = min(now - last_tick, 0.05)  # cap at 50ms to prevent physics explosion
+        last_tick = now
         robot_moved = False
 
         if not local_paused:
@@ -299,26 +328,90 @@ async def physics_loop():
 
             if local_armed:
                 new_heading = local_heading + local_w * 0.1
-                g_vx = local_vx * math.cos(new_heading) - local_vy * math.sin(new_heading)
-                g_vy = local_vx * math.sin(new_heading) + local_vy * math.cos(new_heading)
+                
+                # == 🏎️ 1. Convert local force commands to global force ==
+                g_fx = local_vx * math.cos(new_heading) - local_vy * math.sin(new_heading)
+                g_fy = local_vx * math.sin(new_heading) + local_vy * math.cos(new_heading)
+                
+                # Clamp motor force
+                g_fx = max(-MAX_MOTOR_FORCE, min(MAX_MOTOR_FORCE, g_fx))
+                g_fy = max(-MAX_MOTOR_FORCE, min(MAX_MOTOR_FORCE, g_fy))
                 
                 with state_lock:
-                    if not is_collision(robot_x + g_vx * ROBOT_SPEED_SCALE, robot_y):
-                        robot_x += g_vx * ROBOT_SPEED_SCALE
-                        robot_moved = True
-                    if not is_collision(robot_x, robot_y + g_vy * ROBOT_SPEED_SCALE):
-                        robot_y += g_vy * ROBOT_SPEED_SCALE
-                        robot_moved = True
+                    # == 🏎️ 2. Apply force → acceleration → velocity ==
+                    ax = g_fx / ROBOT_MASS
+                    ay = g_fy / ROBOT_MASS
+                    
+                    robot_vx += ax * dt
+                    robot_vy += ay * dt
+                    
+                    # == 🏎️ 3. Drag (exponential decay toward zero) ==
+                    drag_factor = max(0.0, 1.0 - DRAG_COEFF * dt)
+                    robot_vx *= drag_factor
+                    robot_vy *= drag_factor
+                    
+                    # == 🏎️ 4. Clamp to max speed ==
+                    speed = math.hypot(robot_vx, robot_vy)
+                    if speed > MAX_SPEED:
+                        robot_vx = robot_vx / speed * MAX_SPEED
+                        robot_vy = robot_vy / speed * MAX_SPEED
+                        speed = MAX_SPEED
+                    
+                    # == 🏎️ 5. Grip limit / skidding check ==
+                    if abs(local_w) > 0.001 and speed > 0.3:
+                        turn_radius = speed / abs(local_w)
+                        F_centrifugal = ROBOT_MASS * speed * speed / max(turn_radius, 0.1)
+                        is_skidding = F_centrifugal > MAX_GRIP
+                    else:
+                        is_skidding = False
+                    
+                    # == 🏎️ 6. Move position (with collision check) ==
+                    if is_skidding:
+                        # During skid: reduce velocity by extra friction
+                        robot_vx *= 0.95
+                        robot_vy *= 0.95
+                        # Still move (drift), collision prevents wall penetration
+                        if not is_collision(robot_x + robot_vx * dt, robot_y):
+                            robot_x += robot_vx * dt
+                            robot_moved = True
+                        if not is_collision(robot_x, robot_y + robot_vy * dt):
+                            robot_y += robot_vy * dt
+                            robot_moved = True
+                    else:
+                        # Normal movement
+                        if not is_collision(robot_x + robot_vx * dt, robot_y):
+                            robot_x += robot_vx * dt
+                            robot_moved = True
+                        else:
+                            robot_vx = 0.0  # stop on wall hit
+                        if not is_collision(robot_x, robot_y + robot_vy * dt):
+                            robot_y += robot_vy * dt
+                            robot_moved = True
+                        else:
+                            robot_vy = 0.0
+                    
                     if abs(local_w) > 0.001:
                         robot_heading = new_heading
                         robot_moved = True
+                    
+                    # == 📡 7. Update noisy odometry ==
+                    dist_delta = math.hypot(robot_vx * dt, robot_vy * dt)
+                    total_distance += dist_delta
+                    
+                    odometry_x += robot_vx * dt + random.gauss(0, ODOMETRY_NOISE_STD)
+                    odometry_y += robot_vy * dt + random.gauss(0, ODOMETRY_NOISE_STD)
+                    # Systematic drift proportional to distance
+                    odometry_x += ODOMETRY_DRIFT_RATE * dist_delta * random.gauss(0, 1)
+                    odometry_y += ODOMETRY_DRIFT_RATE * dist_delta * random.gauss(0, 1)
+                    odometry_heading = robot_heading + random.gauss(0, GYRO_DRIFT_STD)
 
             # --- ADAPTIVE BROADCAST ---
-            # Snapshot shared state for broadcast under lock
             with state_lock:
-                snap_x = robot_x
-                snap_y = robot_y
-                snap_heading = robot_heading
+                snap_x = odometry_x     # send noisy position to client
+                snap_y = odometry_y
+                snap_heading = odometry_heading
+                snap_true_x = robot_x   # also send true for diagnostics
+                snap_true_y = robot_y
                 snap_maze = phys_maze
                 snap_h = phys_h
                 snap_w = phys_w
@@ -326,6 +419,7 @@ async def physics_loop():
                 snap_goal_x = goal_x
                 snap_goal_y = goal_y
                 snap_goal_logic = goal_logic
+                snap_skidding = is_skidding
 
             if robot_moved:
                 # Full broadcast with laser data (robot is moving)
@@ -371,7 +465,9 @@ async def physics_loop():
                 broadcast_message({
                     "pos_x": snap_x, "pos_y": snap_y, "heading": snap_heading,
                     "laser": all_hits, "at_meta": at_meta,
-                    "maze_id": snap_maze_id, "goal_cell": snap_goal_logic
+                    "maze_id": snap_maze_id, "goal_cell": snap_goal_logic,
+                    "is_skidding": snap_skidding,
+                    "true_x": snap_true_x, "true_y": snap_true_y
                 })
             elif now - idle_heartbeat > 1.0:
                 # Idle heartbeat — just position, no laser data (saves CPU + bandwidth)
@@ -379,7 +475,9 @@ async def physics_loop():
                 at_meta = bool(math.hypot(snap_x - snap_goal_x, snap_y - snap_goal_y) < 15.0)
                 broadcast_message({
                     "pos_x": snap_x, "pos_y": snap_y, "heading": snap_heading,
-                    "at_meta": at_meta, "maze_id": snap_maze_id, "goal_cell": snap_goal_logic
+                    "at_meta": at_meta, "maze_id": snap_maze_id, "goal_cell": snap_goal_logic,
+                    "is_skidding": snap_skidding,
+                    "true_x": snap_true_x, "true_y": snap_true_y
                 })
 
         # Adaptive sleep: tight when armed, relaxed when idle

@@ -620,10 +620,13 @@ async def client_session(ws):
         # OLD is_at_meta logic REMOVED — robot no longer uses server meta flag
         # ================================================================
 
+        # 🏎️ Corner cutting: in speedrun, start turning early for smooth arcs
+        corner_cut_threshold = 18.0 if controller.fast_run else 5.0
+
         if controller.target_phys is not None:
             tx, ty = controller.target_phys
             dist_to_target = math.hypot(tx - data["pos_x"], ty - data["pos_y"])
-            if dist_to_target < 5.0:
+            if dist_to_target < corner_cut_threshold:
                 # 🟡 Track bounding box on entering new cell
                 if not controller.fast_run and controller.target_logic is not None:
                     controller.exploration_path.append(controller.target_logic)
@@ -639,6 +642,10 @@ async def client_session(ws):
                     controller.track_bounding_box(nl)
                 controller.current_logic_pos = nl
             controller.update_target()
+
+        # 📡 ICP correction: adjust position estimate from laser vs logic_map
+        if has_laser and controller.phys_maze_data is not None and not controller.finished:
+            _icp_correct_position(controller, data)
 
         try:
             cmd_from_dashboard = command_queue.get_nowait()
@@ -662,6 +669,81 @@ async def client_session(ws):
         await ws.send(json_request)
 
         # (File logging removed — use terminal logging instead)
+
+
+# 📡 ICP CORRECTION: adjust position estimate from laser vs logic_map
+def _icp_correct_position(ctrl, data):
+    """Simple ICP-like correction: compare laser hits with expected wall geometry.
+    
+    For each laser ray that hit a wall, compute the expected hit distance
+    from the current position estimate. The offset between expected and
+    actual distance is used to nudge the position estimate toward the
+    correct location.
+    """
+    if not hasattr(ctrl, 'phys_maze_data') or ctrl.phys_maze_data is None:
+        return
+    if not data.get("laser"):
+        return
+    
+    maze = np.array(ctrl.phys_maze_data, dtype=np.uint8)
+    mh, mw = maze.shape
+    heading = ctrl.heading
+    px, py = ctrl.pos_x, ctrl.pos_y
+    
+    dx_sum = 0.0
+    dy_sum = 0.0
+    count = 0
+    
+    for i in range(NUM_SENSORS):
+        s_ang = heading + SENSOR_ANGLES_RAD[i]
+        sx = px + SENSOR_RADIUS * math.cos(s_ang)
+        sy = py + SENSOR_RADIUS * math.sin(s_ang)
+        
+        for j in range(RAYS_PER_SENSOR):
+            idx = i * RAYS_PER_SENSOR + j
+            if idx >= len(data["laser"]):
+                break
+            
+            ray = data["laser"][idx]
+            if not ray["hit"]:
+                continue
+            
+            actual_dist = ray["d"]
+            r_ang = s_ang + ray_angles_rad[j]
+            dx = math.cos(r_ang)
+            dy = math.sin(r_ang)
+            
+            # Hit point from actual laser reading
+            hx = sx + dx * actual_dist
+            hy = sy + dy * actual_dist
+            
+            # Expected hit distance from current position estimate
+            # Ray march in logic_map to find nearest wall
+            expected_dist = float(SENSOR_RANGE)
+            for d in range(1, SENSOR_RANGE, 2):
+                cx = int(sx + dx * d)
+                cy = int(sy + dy * d)
+                if 0 <= cy < mh and 0 <= cx < mw:
+                    if maze[cy, cx] == 1:
+                        expected_dist = float(d)
+                        break
+                else:
+                    break
+            
+            if expected_dist < SENSOR_RANGE and abs(actual_dist - expected_dist) < 30.0:
+                # Compute offset: the robot position should shift so that
+                # expected hit matches actual hit
+                err = actual_dist - expected_dist
+                dx_sum += dx * err
+                dy_sum += dy * err
+                count += 1
+    
+    if count > 5:
+        correction_x = dx_sum / count * 0.3   # damping factor 0.3
+        correction_y = dy_sum / count * 0.3
+        # Apply correction
+        ctrl.pos_x += correction_x
+        ctrl.pos_y += correction_y
 
 
 async def client_main():

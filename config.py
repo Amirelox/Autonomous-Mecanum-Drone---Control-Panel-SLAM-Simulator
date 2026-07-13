@@ -33,3 +33,17 @@ ray_angles_deg = np.linspace(-32, 32, RAYS_PER_SENSOR).tolist()
 # === PRE-COMPUTED RADIANS (avoids math.radians(math.degrees(...)) hot loop) ===
 SENSOR_ANGLES_RAD = [math.radians(a) for a in SENSOR_ANGLES_DEG]
 ray_angles_rad = [math.radians(a) for a in ray_angles_deg]
+
+# ============================================================
+# PHYSICS & DYNAMICS PARAMETERS (EV Model)
+# ============================================================
+ROBOT_MASS = 2.0           # kg
+MAX_MOTOR_FORCE = 4.0      # N (max force from all 4 mecanum wheels)
+DRAG_COEFF = 0.6           # drag (friction + air resistance)
+MAX_GRIP = 5.0             # N (max lateral grip before skidding)
+MAX_SPEED = 6.0            # units/s (terminal velocity from F=ma vs drag)
+
+# Noisy odometry
+ODOMETRY_NOISE_STD = 0.3   # std dev of additive noise per tick
+GYRO_DRIFT_STD = 0.015     # std dev of heading drift per tick
+ODOMETRY_DRIFT_RATE = 0.02 # systematic drift per unit distance traveled
