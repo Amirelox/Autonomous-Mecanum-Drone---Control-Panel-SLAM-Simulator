@@ -96,6 +96,17 @@ class DFSController:
         self.current_benchmark_run = 0
         self.fast_run_times = []
 
+        # === 🟡 BLIND AUTONOMY: BOUNDING BOX & POST-PROCESSING ===
+        self.max_logic_r = 1          # furthest explored row (logic coords)
+        self.max_logic_c = 1          # furthest explored col (logic coords)
+        self.meta_placement = "corner" # "corner" or "center" — set by dashboard
+        self.discovered_n = None      # computed maze height after exploration
+        self.discovered_m = None      # computed maze width after exploration
+        self.computed_goal = None     # locally computed goal cell (logic coords)
+        self.return_path = []         # BFS path to navigate back to (1,1)
+        self.exploration_done = False # set True when fully explored + back at start
+        self.finalizing = False       # prevents re-entering finalize
+
         self._lock = threading.Lock()
 
     def _locked(self):
@@ -165,6 +176,14 @@ class DFSController:
                     return (nr, nc)
         return self.path_stack.pop() if self.path_stack else None
 
+    def track_bounding_box(self, logic_pos):
+        """Update max explored extent when entering a new logic cell."""
+        r, c = logic_pos
+        if r > self.max_logic_r:
+            self.max_logic_r = r
+        if c > self.max_logic_c:
+            self.max_logic_c = c
+
     def compute_shortest_path(self, start, goal):
         """Generates the absolute shortest path using Breadth-First Search (BFS)."""
         from collections import deque
@@ -189,6 +208,62 @@ class DFSController:
                         queue_bfs.append((nr, nc))
         return [start]
 
+    def _finalize_exploration(self):
+        """Post-processing after blind exploration: compute maze size, goal, BFS path."""
+        if self.finalizing:
+            return
+        self.finalizing = True
+
+        # Capture exploration duration
+        if self.run_start_time is not None:
+            self.exploration_duration = time.time() - self.run_start_time
+
+        # 1. Compute discovered maze dimensions
+        self.discovered_n = (self.max_logic_r + 1) // 2
+        self.discovered_m = (self.max_logic_c + 1) // 2
+        log.info(f"🟡 Discovered maze: {self.discovered_n}×{self.discovered_m} "
+                 f"(max_logic_r={self.max_logic_r}, max_logic_c={self.max_logic_c})")
+
+        # 2. Compute goal cell based on placement mode
+        if self.meta_placement == "corner":
+            goal_r = self.max_logic_r
+            goal_c = self.max_logic_c
+        else:  # "center"
+            goal_r = 2 * (self.discovered_n // 2) + 1
+            goal_c = 2 * (self.discovered_m // 2) + 1
+        self.computed_goal = (goal_r, goal_c)
+        # Also set goal_cell so dashboard renders correctly
+        self.goal_cell = (goal_r, goal_c)
+        log.info(f"🟡 Computed goal: {self.computed_goal} (mode={self.meta_placement})")
+
+        # 3. Seal the exploration path into logic_map
+        for idx in range(len(self.exploration_path)):
+            r, c = self.exploration_path[idx]
+            self.logic_map[r][c] = 0
+            if idx > 0:
+                pr, pc = self.exploration_path[idx - 1]
+                self.logic_map[(r + pr) // 2][(c + pc) // 2] = 0
+
+        # 4. Mark goal cell as free
+        self.logic_map[goal_r][goal_c] = 0
+        self.logic_map[(goal_r + 1) // 2][(goal_c + 1) // 2] = 0
+
+        # 5. BFS shortest path from start to goal
+        full_path = self.compute_shortest_path(self.start, self.computed_goal)
+        self.optimized_path = list(full_path[1:]) if len(full_path) > 1 else []
+        log.info(f"🟡 BFS path computed: {len(self.optimized_path)} steps")
+
+        # 6. Transition to speedrun mode
+        self.fast_run = True
+        self.teleporting = True
+        self.target_logic = None
+        self.target_phys = None
+        self.last_vx = 0.0
+        self.last_vy = 0.0
+        self.exploration_done = True
+        self.finalizing = False
+        log.info("🏁 BLIND EXPLORATION COMPLETE! Teleporting to start for speedrun...")
+
     def update_target(self):
         if self.finished:
             self.target_logic = None
@@ -207,8 +282,34 @@ class DFSController:
             return
 
         if self.target_logic is None:
+            # Try normal DFS first
             nxt = self.find_next_target()
             if nxt:
+                self.target_logic = nxt
+                self.target_phys = logic_to_phys(nxt[0], nxt[1])
+                self.last_vx, self.last_vy = 0.0, 0.0
+                return
+
+            # 🟡 BLIND AUTONOMY: path_stack empty — need to return to (1,1)
+            if self.current_logic_pos == self.start:
+                # Back at start with empty stack → exploration complete!
+                self.exploration_done = True
+                log.info("🟡 Exploration complete — all cells visited, back at start")
+                return
+
+            # Not at start yet — compute BFS path back to (1,1)
+            if not self.return_path:
+                path_home = self.compute_shortest_path(self.current_logic_pos, self.start)
+                if len(path_home) > 1:
+                    self.return_path = list(path_home[1:])
+                    log.info(f"🟡 Returning to start via BFS ({len(self.return_path)} steps)")
+                else:
+                    # Already at start?
+                    self.exploration_done = True
+                    return
+
+            if self.return_path:
+                nxt = self.return_path.pop(0)
                 self.target_logic = nxt
                 self.target_phys = logic_to_phys(nxt[0], nxt[1])
                 self.last_vx, self.last_vy = 0.0, 0.0
@@ -290,6 +391,16 @@ class DFSController:
         self.min_seen_x, self.max_seen_x = start_x_phys, start_x_phys
         self.min_seen_y, self.max_seen_y = start_y_phys, start_y_phys
         self.last_vx, self.last_vy = 0.0, 0.0
+        
+        # 🟡 Reset blind autonomy state
+        self.max_logic_r = 1
+        self.max_logic_c = 1
+        self.discovered_n = None
+        self.discovered_m = None
+        self.computed_goal = None
+        self.return_path = []
+        self.exploration_done = False
+        self.finalizing = False
 
 controller = DFSController()
 
@@ -339,8 +450,8 @@ async def client_session(ws):
         data = json.loads(msg)
         has_laser = "laser" in data
 
-        if "goal_cell" in data:
-            controller.goal_cell = tuple(data["goal_cell"])
+        # 🟡 BLIND: ignore goal_cell from server — compute locally
+        # if "goal_cell" in data: controller.goal_cell = tuple(data["goal_cell"])
 
         if "maze_id" in data:
             if data["maze_id"] < controller.current_maze_id:
@@ -355,6 +466,7 @@ async def client_session(ws):
 
         is_at_meta = data.get("at_meta", False)
         if controller.teleporting:
+            # 🟡 BLIND: teleport completes when NOT at meta (i.e. robot moved from start)
             if not is_at_meta:
                 controller.teleporting = False
                 controller.current_logic_pos = (1, 1)
@@ -414,73 +526,54 @@ async def client_session(ws):
 
         controller.update_map(data["pos_x"], data["pos_y"], data["heading"], data["laser"])
 
-        if is_at_meta and not controller.finished and not controller.teleporting:
-            if not controller.fast_run:
-                if controller.run_start_time is not None:
-                    controller.exploration_duration = time.time() - controller.run_start_time
+        # ================================================================
+        # 🟡 BLIND AUTONOMY: transition logic
+        # ================================================================
+        if controller.exploration_done and not controller.fast_run and not controller.finalizing:
+            controller._finalize_exploration()
+            await ws.send(json.dumps({"cmd": "teleport_to_start"}))
+            continue
 
-                for idx in range(len(controller.exploration_path)):
-                    r, c = controller.exploration_path[idx]
-                    controller.logic_map[r][c] = 0
-                    if idx > 0:
-                        pr, pc = controller.exploration_path[idx-1]
-                        controller.logic_map[(r+pr)//2][(c+pc)//2] = 0
-                
-                gr_r, gr_c = controller.goal_cell
-                controller.logic_map[gr_r][gr_c] = 0
-                if controller.current_logic_pos:
-                    cr, cc = controller.current_logic_pos
-                    controller.logic_map[(gr_r+cr)//2][(gr_c+cc)//2] = 0
+        # Handle speedrun completion (fast_run finished)
+        if controller.fast_run and controller.finished and not controller.teleporting:
+            if controller.fast_run_start_time is not None:
+                controller.fast_run_duration = time.time() - controller.fast_run_start_time
 
-                full_path = controller.compute_shortest_path((1, 1), controller.goal_cell)
-                controller.optimized_path = list(full_path[1:])
-                
-                controller.fast_run = True
-                controller.teleporting = True
+            if controller.benchmark_mode:
+                controller.fast_run_times.append(controller.fast_run_duration)
+                log.info(f"📊 [BENCHMARK] Runda {controller.current_benchmark_run}/50 zaliczona! Czas Fast Run: {controller.fast_run_duration:.3f}s")
+                if controller.current_benchmark_run < 50:
+                    controller.current_benchmark_run += 1
+                    await ws.send(json.dumps({"cmd": "reset"}))
+                    continue
+                else:
+                    log.info("🏆 MARATON BENCHMARK ZAKOŃCZONY! Zebrano kompletne statystyki.")
+                    controller.benchmark_mode = False
+                    controller.target_logic = None
+                    controller.target_phys = None
+                    await ws.send(json.dumps({"vx": 0.0, "vy": 0.0, "w": 0.0}))
+                    continue
+            else:
                 controller.target_logic = None
                 controller.target_phys = None
                 controller.last_vx = 0.0
                 controller.last_vy = 0.0
-                
-                await ws.send(json.dumps({"cmd": "teleport_to_start"}))
-                log.info("🏁 EXPLORATION COMPLETE! Obliczanie BFS i teleportacja na start...")
+                await ws.send(json.dumps({"vx": 0.0, "vy": 0.0, "w": 0.0}))
+                log.info("🏆 TRYB INDYWIDUALNY ZAKOŃCZONY SUKCESEM!")
                 continue
-            else:
-                if controller.fast_run_start_time is not None:
-                    controller.fast_run_duration = time.time() - controller.fast_run_start_time
 
-                if controller.benchmark_mode:
-                    controller.fast_run_times.append(controller.fast_run_duration)
-                    log.info(f"📊 [BENCHMARK] Runda {controller.current_benchmark_run}/50 zaliczona! Czas Fast Run: {controller.fast_run_duration:.3f}s")
-                    
-                    if controller.current_benchmark_run < 50:
-                        controller.current_benchmark_run += 1
-                        await ws.send(json.dumps({"cmd": "reset"}))
-                        continue
-                    else:
-                        log.info("🏆 MARATON BENCHMARK ZAKOŃCZONY! Zebrano kompletne statystyki.")
-                        controller.benchmark_mode = False
-                        controller.finished = True
-                        controller.target_logic = None
-                        controller.target_phys = None
-                        await ws.send(json.dumps({"vx": 0.0, "vy": 0.0, "w": 0.0}))
-                        continue
-                else:
-                    controller.finished = True
-                    controller.target_logic = None
-                    controller.target_phys = None
-                    controller.last_vx = 0.0
-                    controller.last_vy = 0.0
-                    await ws.send(json.dumps({"vx": 0.0, "vy": 0.0, "w": 0.0}))
-                    log.info("🏆 TRYB INDYWIDUALNY ZAKOŃCZONY SUKCESEM!")
-                    continue
+        # ================================================================
+        # OLD is_at_meta logic REMOVED — robot no longer uses server meta flag
+        # ================================================================
 
         if controller.target_phys is not None:
             tx, ty = controller.target_phys
             dist_to_target = math.hypot(tx - data["pos_x"], ty - data["pos_y"])
             if dist_to_target < 5.0:
+                # 🟡 Track bounding box on entering new cell
                 if not controller.fast_run and controller.target_logic is not None:
                     controller.exploration_path.append(controller.target_logic)
+                    controller.track_bounding_box(controller.target_logic)
                 controller.current_logic_pos = controller.target_logic
                 controller.target_logic = None
                 controller.target_phys = None
@@ -488,6 +581,8 @@ async def client_session(ws):
         if controller.target_logic is None and not controller.finished:
             if not controller.fast_run:
                 nl = phys_to_logic(data["pos_x"], data["pos_y"])
+                if nl != controller.current_logic_pos:
+                    controller.track_bounding_box(nl)
                 controller.current_logic_pos = nl
             controller.update_target()
 
@@ -498,6 +593,10 @@ async def client_session(ws):
                 command_queue.task_done()
                 continue
             elif isinstance(cmd_from_dashboard, dict):
+                # 🟡 BLIND: intercept meta_placement updates
+                if cmd_from_dashboard.get("cmd") == "set_meta":
+                    controller.meta_placement = cmd_from_dashboard.get("value", "corner")
+                    log.info(f"🟡 Meta placement set to: {controller.meta_placement}")
                 await ws.send(json.dumps(cmd_from_dashboard))
                 command_queue.task_done()
                 continue
