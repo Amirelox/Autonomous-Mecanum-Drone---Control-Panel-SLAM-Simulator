@@ -592,16 +592,21 @@ async def client_session(ws):
                 log.info(f"📊 [BENCHMARK] Runda {controller.current_benchmark_run}/50 zaliczona! Czas Fast Run: {controller.fast_run_duration:.3f}s")
                 if controller.current_benchmark_run < 50:
                     controller.current_benchmark_run += 1
+                    controller.fast_run = False  # prevent re-entry
                     await ws.send(json.dumps({"cmd": "reset"}))
                     continue
                 else:
                     log.info("🏆 MARATON BENCHMARK ZAKOŃCZONY! Zebrano kompletne statystyki.")
                     controller.benchmark_mode = False
+                    controller.fast_run = False
+                    controller.exploration_done = False
                     controller.target_logic = None
                     controller.target_phys = None
                     await ws.send(json.dumps({"vx": 0.0, "vy": 0.0, "w": 0.0}))
                     continue
             else:
+                controller.fast_run = False
+                controller.exploration_done = False
                 controller.target_logic = None
                 controller.target_phys = None
                 controller.last_vx = 0.0
