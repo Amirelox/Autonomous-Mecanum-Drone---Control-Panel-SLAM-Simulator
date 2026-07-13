@@ -4,7 +4,7 @@ Niniejszy dokument określa harmonogram i architekturę techniczną rozbudowy au
 
 ---
 
-## 🟡 Wtorek: Ślepa Autonomia, Dynamiczne Bounding Box i Czysty BFS
+## ✅ Wtorek (Zrealizowane): Ślepa Autonomia, Dynamiczne Bounding Box i Czysty BFS
 
 **Cel:** Całkowite odcięcie algorytmu klienta od wiedzy „z góry”. Robot nie zna wymiarów labiryntu ($N, M$), nie dostaje współrzędnych mety z sieci i samodzielnie wylicza parametry środowiska po zakończeniu pierwszej próby. Zamiast potrójnego turnieju, ze względu na prostotę labiryntu, stosowany jest wyłącznie wydajny algorytm BFS.
 
