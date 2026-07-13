@@ -24,7 +24,9 @@ from config import (
     N, M, CELL_SIZE, WALL_THICK, PATH_WIDTH,
     ROBOT_W_WIDTH, ROBOT_L_LENGTH, SENSOR_RADIUS, 
     SENSOR_RANGE, NOISE_STD, NUM_SENSORS, 
-    RAYS_PER_SENSOR, SENSOR_ANGLES_DEG, ray_angles_deg
+    RAYS_PER_SENSOR, SENSOR_ANGLES_DEG, ray_angles_deg,
+    # Pre-computed radians for fast ray marching
+    SENSOR_ANGLES_RAD, ray_angles_rad
 )
 
 def generate_maze_no_loops(width, height):
@@ -328,29 +330,42 @@ async def physics_loop():
             if robot_moved:
                 # Full broadcast with laser data (robot is moving)
                 all_hits = []
+                h_cos = math.cos(snap_heading)
+                h_sin = math.sin(snap_heading)
+                
                 for i in range(NUM_SENSORS):
-                    s_hdg = math.radians(math.degrees(snap_heading) + SENSOR_ANGLES_DEG[i])
-                    sx = snap_x + SENSOR_RADIUS * math.cos(s_hdg)
-                    sy = snap_y + SENSOR_RADIUS * math.sin(s_hdg)
+                    # Sensor mounting in global frame
+                    s_ang = snap_heading + SENSOR_ANGLES_RAD[i]
+                    s_cos = math.cos(s_ang)
+                    s_sin = math.sin(s_ang)
+                    sx = snap_x + SENSOR_RADIUS * s_cos
+                    sy = snap_y + SENSOR_RADIUS * s_sin
                     
-                    for ang in ray_angles_deg:
-                        r_ang = s_hdg + math.radians(ang)
-                        dx, dy = math.cos(r_ang), math.sin(r_ang)
-                        dist, hit = float(SENSOR_RANGE + random.gauss(0, NOISE_STD)), False
+                    for ang_rad in ray_angles_rad:
+                        r_ang = s_ang + ang_rad
+                        dx = math.cos(r_ang)
+                        dy = math.sin(r_ang)
                         
-                        max_steps = min(int(dist), SENSOR_RANGE)
-                        for d in range(1, max_steps):
+                        # Single noise sample per ray
+                        noise = random.gauss(0, NOISE_STD)
+                        max_dist = float(SENSOR_RANGE + noise)
+                        hit_dist = max_dist
+                        hit = False
+                        
+                        # Step by 2 — pixel-perfect not needed for 10-wide robot
+                        max_steps = min(int(max_dist), SENSOR_RANGE)
+                        for d in range(1, max_steps, 2):
                             cx = int(sx + dx * d)
                             cy = int(sy + dy * d)
                             if 0 <= cy < snap_h and 0 <= cx < snap_w:
                                 if snap_maze[cy, cx] == 1:
-                                    dist = float(d + random.gauss(0, NOISE_STD))
+                                    hit_dist = float(d + noise)
                                     hit = True
                                     break
                             else:
                                 break
                         
-                        all_hits.append({"d": max(1.0, dist), "hit": hit})
+                        all_hits.append({"d": max(1.0, hit_dist), "hit": hit})
 
                 at_meta = bool(math.hypot(snap_x - snap_goal_x, snap_y - snap_goal_y) < 15.0)
                 broadcast_message({

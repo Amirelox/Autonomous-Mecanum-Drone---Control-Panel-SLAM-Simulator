@@ -22,7 +22,8 @@ from config import (
     N, M, CELL_SIZE, WALL_THICK, PATH_WIDTH,
     ROBOT_W_WIDTH, ROBOT_L_LENGTH, SENSOR_RADIUS, 
     SENSOR_RANGE, NUM_SENSORS, RAYS_PER_SENSOR, 
-    SENSOR_ANGLES_DEG, ray_angles_deg
+    SENSOR_ANGLES_DEG, ray_angles_deg,
+    SENSOR_ANGLES_RAD, ray_angles_rad
 )
 
 # ============================================================
@@ -124,11 +125,11 @@ class DFSController:
         self.max_seen_y = max(self.max_seen_y, pos_y)
 
         for i in range(NUM_SENSORS):
-            s_hdg = math.radians(math.degrees(heading) + SENSOR_ANGLES_DEG[i])
+            s_hdg = heading + SENSOR_ANGLES_RAD[i]
             sx = pos_x + SENSOR_RADIUS * math.cos(s_hdg)
             sy = pos_y + SENSOR_RADIUS * math.sin(s_hdg)
             for j in range(RAYS_PER_SENSOR):
-                r_ang = s_hdg + math.radians(ray_angles_deg[j])
+                r_ang = s_hdg + ray_angles_rad[j]
                 dx, dy = math.cos(r_ang), math.sin(r_ang)
                 dist = laser_data[i * RAYS_PER_SENSOR + j]["d"]
                 is_hit = laser_data[i * RAYS_PER_SENSOR + j]["hit"]

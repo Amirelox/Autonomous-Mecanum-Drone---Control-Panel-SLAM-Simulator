@@ -129,15 +129,15 @@ with col1:
         
         # Draw laser lines (dynamic)
         if hasattr(controller, 'laser_data') and controller.laser_data:
-            from client import NUM_SENSORS, RAYS_PER_SENSOR, SENSOR_ANGLES_DEG, SENSOR_RADIUS, ray_angles_deg
+            from client import NUM_SENSORS, RAYS_PER_SENSOR, SENSOR_ANGLES_RAD, SENSOR_RADIUS, ray_angles_rad
             idx = 0
             for i in range(NUM_SENSORS):
-                s_hdg = math.radians(math.degrees(controller.heading) + SENSOR_ANGLES_DEG[i])
+                s_hdg = controller.heading + SENSOR_ANGLES_RAD[i]
                 sx = controller.pos_x + SENSOR_RADIUS * math.cos(s_hdg)
                 sy = controller.pos_y + SENSOR_RADIUS * math.sin(s_hdg)
-                for ang in ray_angles_deg:
+                for ang in ray_angles_rad:
                     if idx >= len(controller.laser_data): break
-                    r_ang = s_hdg + math.radians(ang)
+                    r_ang = s_hdg + ang
                     dist = controller.laser_data[idx]["d"]
                     ex, ey = int(sx + math.cos(r_ang) * dist), int(sy + math.sin(r_ang) * dist)
                     cv2.line(img_real, (int(sx), int(sy)), (ex, ey), (255, 50, 50), 1)
