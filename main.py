@@ -28,8 +28,7 @@ from config import (
     # Pre-computed radians for fast ray marching
     SENSOR_ANGLES_RAD, ray_angles_rad,
     # Physics & dynamics
-    ROBOT_MASS, MAX_MOTOR_FORCE, DRAG_DECAY,
-    MAX_SPEED, CMD_FORCE_SCALE,
+    ROBOT_WHEELBASE, MAX_SPEED, ACCEL_RATE, DECEL_RATE, STOP_THRESHOLD,
     ODOMETRY_NOISE_STD, GYRO_DRIFT_STD, ODOMETRY_DRIFT_RATE
 )
 
@@ -329,65 +328,67 @@ async def physics_loop():
             if local_armed:
                 new_heading = local_heading + local_w * 0.1
                 
-                # == 🏎️ 1. Scale client cmd (0-0.6) to motor force ==
-                fx = local_vx * CMD_FORCE_SCALE
-                fy = local_vy * CMD_FORCE_SCALE
+                # == 🏎️ 1. Compute target velocity from client cmd ==
+                # Convert local cmd to global target
+                target_gx = local_vx * math.cos(new_heading) - local_vy * math.sin(new_heading)
+                target_gy = local_vx * math.sin(new_heading) + local_vy * math.cos(new_heading)
                 
-                # Convert local forces to global frame
-                g_fx = fx * math.cos(new_heading) - fy * math.sin(new_heading)
-                g_fy = fx * math.sin(new_heading) + fy * math.cos(new_heading)
-                
-                # Clamp motor force
-                g_fx = max(-MAX_MOTOR_FORCE, min(MAX_MOTOR_FORCE, g_fx))
-                g_fy = max(-MAX_MOTOR_FORCE, min(MAX_MOTOR_FORCE, g_fy))
+                # Scale to max speed
+                target_gx *= MAX_SPEED
+                target_gy *= MAX_SPEED
                 
                 with state_lock:
-                    # == 🏎️ 2. F = ma → per-tick velocity change ==
-                    accel_x = (g_fx / ROBOT_MASS) * dt
-                    accel_y = (g_fy / ROBOT_MASS) * dt
+                    # == 🏎️ 2. Velocity ramping (smooth accel/decel) ==
+                    # Use stronger rate when velocity opposes target (braking)
+                    rx, ry = target_gx - robot_vx, target_gy - robot_vy
+                    rate_x = DECEL_RATE if rx * robot_vx < 0 else ACCEL_RATE
+                    rate_y = DECEL_RATE if ry * robot_vy < 0 else ACCEL_RATE
                     
-                    robot_vx += accel_x
-                    robot_vy += accel_y
+                    robot_vx += rx * rate_x
+                    robot_vy += ry * rate_y
                     
-                    # == 🏎️ 3. Drag (per-tick exponential decay) ==
-                    robot_vx *= DRAG_DECAY
-                    robot_vy *= DRAG_DECAY
+                    # Snap to zero when near stop
+                    if abs(robot_vx) < STOP_THRESHOLD:
+                        robot_vx = 0.0
+                    if abs(robot_vy) < STOP_THRESHOLD:
+                        robot_vy = 0.0
                     
-                    # == 🏎️ 4. Clamp to max speed ==
+                    # == 🏎️ 3. Skidding check ==
                     speed = math.hypot(robot_vx, robot_vy)
-                    if speed > MAX_SPEED:
-                        robot_vx = robot_vx / speed * MAX_SPEED
-                        robot_vy = robot_vy / speed * MAX_SPEED
-                        speed = MAX_SPEED
-                    
-                    # == 🏎️ 5. Grip limit / skidding check (heuristic) ==
-                    # Skid when turning sharply at speed
-                    if abs(local_w) > 0.01 and speed > 0.8:
-                        is_skidding = (speed * abs(local_w)) > 0.08
+                    if abs(local_w) > 0.01 and speed > 0.5:
+                        is_skidding = (speed * abs(local_w)) > 0.1
                     else:
                         is_skidding = False
                     
-                    # == 🏎️ 6. Move position (robot_vx/vy are per-tick displacement) ==
+                    # == 🏎️ 4. Move with collision check (no bounce) ==
                     if is_skidding:
-                        robot_vx *= 0.95
-                        robot_vy *= 0.95
+                        robot_vx *= 0.9  # extra friction during skid
+                        robot_vy *= 0.9
                     
                     if not is_collision(robot_x + robot_vx, robot_y):
                         robot_x += robot_vx
                         robot_moved = True
                     else:
-                        robot_vx *= -0.3  # bounce
+                        robot_vx = 0.0  # STOP on wall hit — no bounce!
                     if not is_collision(robot_x, robot_y + robot_vy):
                         robot_y += robot_vy
                         robot_moved = True
                     else:
-                        robot_vy *= -0.3
+                        robot_vy = 0.0
                     
                     if abs(local_w) > 0.001:
                         robot_heading = new_heading
                         robot_moved = True
                     
-                    # == 📡 7. Update noisy odometry ==
+                    # == 📡 5. Update noisy odometry ==
+                    dist_delta = math.hypot(robot_vx, robot_vy)
+                    total_distance += dist_delta
+                    
+                    odometry_x += robot_vx + random.gauss(0, ODOMETRY_NOISE_STD)
+                    odometry_y += robot_vy + random.gauss(0, ODOMETRY_NOISE_STD)
+                    odometry_x += ODOMETRY_DRIFT_RATE * dist_delta * random.gauss(0, 1)
+                    odometry_y += ODOMETRY_DRIFT_RATE * dist_delta * random.gauss(0, 1)
+                    odometry_heading = robot_heading + random.gauss(0, GYRO_DRIFT_STD)
                     dist_delta = math.hypot(robot_vx, robot_vy)
                     total_distance += dist_delta
                     
