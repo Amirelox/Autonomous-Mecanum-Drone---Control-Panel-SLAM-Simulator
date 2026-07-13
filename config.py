@@ -37,11 +37,14 @@ ray_angles_rad = [math.radians(a) for a in ray_angles_deg]
 # ============================================================
 # PHYSICS & DYNAMICS PARAMETERS (EV Model)
 # ============================================================
-ROBOT_MASS = 2.0           # kg
-MAX_MOTOR_FORCE = 4.0      # N (max force from all 4 mecanum wheels)
-DRAG_COEFF = 0.6           # drag (friction + air resistance)
-MAX_GRIP = 5.0             # N (max lateral grip before skidding)
-MAX_SPEED = 6.0            # units/s (terminal velocity from F=ma vs drag)
+ROBOT_MASS = 1.0           # kg (lighter = more responsive)
+MAX_MOTOR_FORCE = 4.0      # N at cmd=0.6 (scaled in physics loop)
+DRAG_DECAY = 0.94          # per-tick velocity retention (0.94 → v_terminal ≈ 1.88/tick)
+MAX_GRIP = 8.0             # N (max lateral grip before skidding)
+MAX_SPEED = 3.5            # max units/tick (speed cap)
+
+# Scale: client sends 0-0.6 as velocity commands; we map 0.6 → MAX_MOTOR_FORCE
+CMD_FORCE_SCALE = MAX_MOTOR_FORCE / 0.6  # ~6.67
 
 # Noisy odometry
 ODOMETRY_NOISE_STD = 0.3   # std dev of additive noise per tick

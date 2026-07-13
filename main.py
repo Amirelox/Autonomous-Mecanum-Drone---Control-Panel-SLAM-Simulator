@@ -28,8 +28,8 @@ from config import (
     # Pre-computed radians for fast ray marching
     SENSOR_ANGLES_RAD, ray_angles_rad,
     # Physics & dynamics
-    ROBOT_MASS, MAX_MOTOR_FORCE, DRAG_COEFF,
-    MAX_GRIP, MAX_SPEED,
+    ROBOT_MASS, MAX_MOTOR_FORCE, DRAG_DECAY,
+    MAX_GRIP, MAX_SPEED, CMD_FORCE_SCALE,
     ODOMETRY_NOISE_STD, GYRO_DRIFT_STD, ODOMETRY_DRIFT_RATE
 )
 
@@ -302,7 +302,7 @@ async def physics_loop():
     global robot_vx, robot_vy, is_skidding
     global odometry_x, odometry_y, odometry_heading, total_distance
     idle_heartbeat = 0.0
-    last_tick = time.time()
+    last_iter = time.time()
     
     while True:
         with state_lock:
@@ -316,8 +316,8 @@ async def physics_loop():
             local_sim_speed = SIM_SPEED
 
         now = time.time()
-        dt = min(now - last_tick, 0.05)  # cap at 50ms to prevent physics explosion
-        last_tick = now
+        dt = min(now - last_iter, 0.05)  # cap to prevent physics explosion
+        last_iter = now
         robot_moved = False
 
         if not local_paused:
@@ -329,26 +329,29 @@ async def physics_loop():
             if local_armed:
                 new_heading = local_heading + local_w * 0.1
                 
-                # == 🏎️ 1. Convert local force commands to global force ==
-                g_fx = local_vx * math.cos(new_heading) - local_vy * math.sin(new_heading)
-                g_fy = local_vx * math.sin(new_heading) + local_vy * math.cos(new_heading)
+                # == 🏎️ 1. Scale client cmd (0-0.6) to motor force ==
+                fx = local_vx * CMD_FORCE_SCALE
+                fy = local_vy * CMD_FORCE_SCALE
+                
+                # Convert local forces to global frame
+                g_fx = fx * math.cos(new_heading) - fy * math.sin(new_heading)
+                g_fy = fx * math.sin(new_heading) + fy * math.cos(new_heading)
                 
                 # Clamp motor force
                 g_fx = max(-MAX_MOTOR_FORCE, min(MAX_MOTOR_FORCE, g_fx))
                 g_fy = max(-MAX_MOTOR_FORCE, min(MAX_MOTOR_FORCE, g_fy))
                 
                 with state_lock:
-                    # == 🏎️ 2. Apply force → acceleration → velocity ==
-                    ax = g_fx / ROBOT_MASS
-                    ay = g_fy / ROBOT_MASS
+                    # == 🏎️ 2. F = ma → per-tick velocity change ==
+                    accel_x = (g_fx / ROBOT_MASS) * dt
+                    accel_y = (g_fy / ROBOT_MASS) * dt
                     
-                    robot_vx += ax * dt
-                    robot_vy += ay * dt
+                    robot_vx += accel_x
+                    robot_vy += accel_y
                     
-                    # == 🏎️ 3. Drag (exponential decay toward zero) ==
-                    drag_factor = max(0.0, 1.0 - DRAG_COEFF * dt)
-                    robot_vx *= drag_factor
-                    robot_vy *= drag_factor
+                    # == 🏎️ 3. Drag (per-tick exponential decay) ==
+                    robot_vx *= DRAG_DECAY
+                    robot_vy *= DRAG_DECAY
                     
                     # == 🏎️ 4. Clamp to max speed ==
                     speed = math.hypot(robot_vx, robot_vy)
@@ -360,47 +363,37 @@ async def physics_loop():
                     # == 🏎️ 5. Grip limit / skidding check ==
                     if abs(local_w) > 0.001 and speed > 0.3:
                         turn_radius = speed / abs(local_w)
-                        F_centrifugal = ROBOT_MASS * speed * speed / max(turn_radius, 0.1)
+                        F_centrifugal = ROBOT_MASS * (speed/dt) * (speed/dt) / max(turn_radius, 0.1)
                         is_skidding = F_centrifugal > MAX_GRIP
                     else:
                         is_skidding = False
                     
-                    # == 🏎️ 6. Move position (with collision check) ==
+                    # == 🏎️ 6. Move position (robot_vx/vy are per-tick displacement) ==
                     if is_skidding:
-                        # During skid: reduce velocity by extra friction
                         robot_vx *= 0.95
                         robot_vy *= 0.95
-                        # Still move (drift), collision prevents wall penetration
-                        if not is_collision(robot_x + robot_vx * dt, robot_y):
-                            robot_x += robot_vx * dt
-                            robot_moved = True
-                        if not is_collision(robot_x, robot_y + robot_vy * dt):
-                            robot_y += robot_vy * dt
-                            robot_moved = True
+                    
+                    if not is_collision(robot_x + robot_vx, robot_y):
+                        robot_x += robot_vx
+                        robot_moved = True
                     else:
-                        # Normal movement
-                        if not is_collision(robot_x + robot_vx * dt, robot_y):
-                            robot_x += robot_vx * dt
-                            robot_moved = True
-                        else:
-                            robot_vx = 0.0  # stop on wall hit
-                        if not is_collision(robot_x, robot_y + robot_vy * dt):
-                            robot_y += robot_vy * dt
-                            robot_moved = True
-                        else:
-                            robot_vy = 0.0
+                        robot_vx *= -0.3  # bounce
+                    if not is_collision(robot_x, robot_y + robot_vy):
+                        robot_y += robot_vy
+                        robot_moved = True
+                    else:
+                        robot_vy *= -0.3
                     
                     if abs(local_w) > 0.001:
                         robot_heading = new_heading
                         robot_moved = True
                     
                     # == 📡 7. Update noisy odometry ==
-                    dist_delta = math.hypot(robot_vx * dt, robot_vy * dt)
+                    dist_delta = math.hypot(robot_vx, robot_vy)
                     total_distance += dist_delta
                     
-                    odometry_x += robot_vx * dt + random.gauss(0, ODOMETRY_NOISE_STD)
-                    odometry_y += robot_vy * dt + random.gauss(0, ODOMETRY_NOISE_STD)
-                    # Systematic drift proportional to distance
+                    odometry_x += robot_vx + random.gauss(0, ODOMETRY_NOISE_STD)
+                    odometry_y += robot_vy + random.gauss(0, ODOMETRY_NOISE_STD)
                     odometry_x += ODOMETRY_DRIFT_RATE * dist_delta * random.gauss(0, 1)
                     odometry_y += ODOMETRY_DRIFT_RATE * dist_delta * random.gauss(0, 1)
                     odometry_heading = robot_heading + random.gauss(0, GYRO_DRIFT_STD)
