@@ -22,7 +22,7 @@ SENSOR_RADIUS = ROBOT_L_LENGTH / 2.0
 # LASER SENSOR PARAMETERS (LIDAR / DISTANCE)
 # ============================================================
 SENSOR_RANGE = 200
-NOISE_STD = 1.0 
+NOISE_STD = 0.8 
 NUM_SENSORS = 6
 RAYS_PER_SENSOR = 15
 SENSOR_ANGLES_DEG = [0, 60, 120, 180, 240, 300] # Mounting angles on the frame
@@ -35,20 +35,6 @@ SENSOR_ANGLES_RAD = [math.radians(a) for a in SENSOR_ANGLES_DEG]
 ray_angles_rad = [math.radians(a) for a in ray_angles_deg]
 
 # ============================================================
-# PHYSICS & DYNAMICS PARAMETERS (Velocity Ramping Model)
+# ROBOT CONTROL PARAMETERS
 # ============================================================
-ROBOT_WHEELBASE = 8.0      # turning responsiveness (lower = faster turns)
-MAX_SPEED = 3.0            # max per-tick displacement at cmd=1.0
-ACCEL_RATE = 0.25          # per-tick approach to target velocity (acceleration)
-DECEL_RATE = 0.45          # per-tick braking when stopping or reversing
-STOP_THRESHOLD = 0.01      # velocity below which we snap to zero
-
-# Noisy odometry (set to zero for deterministic navigation)
-ODOMETRY_NOISE_STD = 0.0   # was 0.3 — zeroed to prevent wall hits from drift
-GYRO_DRIFT_STD = 0.0       # was 0.015
-ODOMETRY_DRIFT_RATE = 0.0  # was 0.02
-
-# Noisy odometry
-ODOMETRY_NOISE_STD = 0.3   # std dev of additive noise per tick
-GYRO_DRIFT_STD = 0.015     # std dev of heading drift per tick
-ODOMETRY_DRIFT_RATE = 0.02 # systematic drift per unit distance traveled
+ROBOT_SPEED_SCALE = 3.0    # simple velocity multiplier (servo-style, no inertia)
