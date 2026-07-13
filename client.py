@@ -297,16 +297,62 @@ class DFSController:
                 log.info("🟡 Exploration complete — all cells visited, back at start")
                 return
 
-            # Not at start yet — compute BFS path back to (1,1)
+            # Not at start yet — seal exploration path and compute BFS back to (1,1)
             if not self.return_path:
+                # First seal the known path so BFS can traverse it
+                for idx in range(len(self.exploration_path)):
+                    r, c = self.exploration_path[idx]
+                    self.logic_map[r][c] = 0
+                    if idx > 0:
+                        pr, pc = self.exploration_path[idx-1]
+                        self.logic_map[(r+pr)//2][(c+pc)//2] = 0
+
                 path_home = self.compute_shortest_path(self.current_logic_pos, self.start)
                 if len(path_home) > 1:
                     self.return_path = list(path_home[1:])
                     log.info(f"🟡 Returning to start via BFS ({len(self.return_path)} steps)")
                 else:
-                    # Already at start?
-                    self.exploration_done = True
-                    return
+                    # BFS failed — some cells still unknown (-1). Do a second pass
+                    # treating -1 cells as traversable (they're unvisited paths, not walls)
+                    from collections import deque
+                    dq = deque([self.current_logic_pos])
+                    parent = {self.current_logic_pos: None}
+                    found = False
+                    while dq and not found:
+                        cr, cc = dq.popleft()
+                        for dr, dc in [(0, 2), (2, 0), (0, -2), (-2, 0)]:
+                            nr, nc = cr + dr, cc + dc
+                            if not (0 <= nr < LOGIC_ROWS and 0 <= nc < LOGIC_COLS):
+                                continue
+                            if (nr, nc) in parent:
+                                continue
+                            mid_r, mid_c = (cr + nr)//2, (cc + nc)//2
+                            mid_val = self.logic_map[mid_r][mid_c]
+                            tgt_val = self.logic_map[nr][nc]
+                            # Can traverse if mid is not a wall and target is not a wall
+                            if mid_val != 1 and tgt_val != 1:
+                                if mid_val == -1:
+                                    self.logic_map[mid_r][mid_c] = 0
+                                if tgt_val == -1:
+                                    self.logic_map[nr][nc] = 0
+                                parent[(nr, nc)] = (cr, cc)
+                                dq.append((nr, nc))
+                                if (nr, nc) == self.start:
+                                    found = True
+                                    break
+                    if found:
+                        # Reconstruct path: follow parent chain from current to start
+                        p = []
+                        pos = self.current_logic_pos
+                        while pos != self.start:
+                            pos = parent[pos]
+                            p.append(pos)
+                        self.return_path = p  # [step1, step2, ..., start]
+                        log.info(f"🟡 Returning to start via BFS-soft ({len(self.return_path)} steps)")
+                    else:
+                        log.warning("🟡 No return path found — forcing exploration complete")
+                        self.exploration_done = True
+                        return
 
             if self.return_path:
                 nxt = self.return_path.pop(0)
@@ -321,7 +367,9 @@ class DFSController:
 
         tx, ty = self.target_phys
         
-        if self.target_logic == self.goal_cell:
+        # Safety offset only in speedrun mode — during blind exploration
+        # the robot must treat every cell equally (no "goal" known yet)
+        if self.fast_run and self.target_logic == self.goal_cell:
             diff_x = tx - self.pos_x
             diff_y = ty - self.pos_y
             safety_offset = 8.0
