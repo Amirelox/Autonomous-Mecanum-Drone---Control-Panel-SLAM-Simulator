@@ -164,13 +164,19 @@ class DFSController:
                                     pass
                                 else:
                                     self.logic_map[wr][wc] = 1
-                                    debug_log.info(
-                                        f"WALL_MARKED cell=({wr},{wc}) "
-                                        f"hit_pos=({sx+dx*dist:.1f},{sy+dy*dist:.1f}) "
-                                        f"robot=({pos_x:.1f},{pos_y:.1f}) "
-                                        f"heading={math.degrees(heading):.0f}° "
-                                        f"prob={prob_map[hy, hx]:.2f} ray={i}-{j}"
-                                    )
+                                    # Throttle WALL_MARKED: log 1st hit, then every ~50th
+                                    if not hasattr(controller, '_wall_log_count'):
+                                        controller._wall_log_count = 0
+                                    controller._wall_log_count += 1
+                                    if controller._wall_log_count == 1 or controller._wall_log_count >= 50:
+                                        controller._wall_log_count = 0
+                                        debug_log.info(
+                                            f"WALL_MARKED cell=({wr},{wc}) "
+                                            f"hit_pos=({sx+dx*dist:.1f},{sy+dy*dist:.1f}) "
+                                            f"robot=({pos_x:.1f},{pos_y:.1f}) "
+                                            f"heading={math.degrees(heading):.0f}° "
+                                            f"prob={prob_map[hy, hx]:.2f} ray={i}-{j}"
+                                        )
 
     def find_next_target(self):
         """Scans adjacent nodes to select the next step for DFS exploration."""
@@ -689,12 +695,12 @@ async def client_session(ws):
         json_request = json.dumps(command)
         await ws.send(json_request)
 
-        # Log every ~10th command for debug tracing
+        # Log every ~30th command for debug tracing
         if hasattr(controller, '_cmd_counter'):
             controller._cmd_counter += 1
         else:
             controller._cmd_counter = 0
-        if controller._cmd_counter % 10 == 0:
+        if controller._cmd_counter % 30 == 0:
             debug_log.debug(
                 f"CMD target={controller.target_logic} "
                 f"pos=({controller.pos_x:.1f},{controller.pos_y:.1f}) "

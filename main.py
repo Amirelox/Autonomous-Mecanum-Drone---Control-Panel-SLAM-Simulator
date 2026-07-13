@@ -331,17 +331,14 @@ async def physics_loop():
                 new_heading = local_heading + local_w * 0.1
                 
                 # == 🏎️ 1. Compute target velocity from client cmd ==
-                # Convert local cmd to global target
                 target_gx = local_vx * math.cos(new_heading) - local_vy * math.sin(new_heading)
                 target_gy = local_vx * math.sin(new_heading) + local_vy * math.cos(new_heading)
                 
-                # Scale to max speed
                 target_gx *= MAX_SPEED
                 target_gy *= MAX_SPEED
                 
                 with state_lock:
                     # == 🏎️ 2. Velocity ramping (smooth accel/decel) ==
-                    # Use stronger rate when velocity opposes target (braking)
                     rx, ry = target_gx - robot_vx, target_gy - robot_vy
                     rate_x = DECEL_RATE if rx * robot_vx < 0 else ACCEL_RATE
                     rate_y = DECEL_RATE if ry * robot_vy < 0 else ACCEL_RATE
@@ -349,14 +346,12 @@ async def physics_loop():
                     robot_vx += rx * rate_x
                     robot_vy += ry * rate_y
                     
-                    # Snap to zero when near stop
                     if abs(robot_vx) < STOP_THRESHOLD:
                         robot_vx = 0.0
                     if abs(robot_vy) < STOP_THRESHOLD:
                         robot_vy = 0.0
                     
-                    # Log velocity changes (every ~20 ticks = ~0.6s)
-                    if random.random() < 0.05:
+                    if random.random() < 0.02:
                         speed = math.hypot(robot_vx, robot_vy)
                         debug_log.debug(
                             f"PHYSICS pos=({robot_x:.1f},{robot_y:.1f}) "
@@ -373,7 +368,6 @@ async def physics_loop():
                     else:
                         is_skidding = False
                     
-                    # == 🏎️ 4. Move with collision check (full diagonal first) ==
                     if is_skidding:
                         robot_vx *= 0.9
                         robot_vy *= 0.9
@@ -381,58 +375,38 @@ async def physics_loop():
                     new_x = robot_x + robot_vx
                     new_y = robot_y + robot_vy
                     
-                    # Full diagonal check — prevents corner clipping
+                    # == 🏎️ 4. NAPRAWIONY model kolizji (Sliding Collision Support) ==
+                    orig_x = robot_x
+                    orig_y = robot_y
+                    
                     if not is_collision(new_x, new_y):
                         robot_x = new_x
                         robot_y = new_y
                         robot_moved = True
                     else:
-                        # Collision! Log details for debugging
-                        if robot_moved:
-                            debug_log.warning(
-                                f"COLLISION blocked diagonal: pos=({robot_x:.1f},{robot_y:.1f}) "
-                                f"→ new=({new_x:.1f},{new_y:.1f}) vel=({robot_vx:.2f},{robot_vy:.2f})"
-                            )
-                        # Fall back to individual axes
                         moved_x = False
                         moved_y = False
-                        if not is_collision(new_x, robot_y):
+                        # Sprawdź niezależnie ruch po osi X przy starej pozycji Y
+                        if not is_collision(new_x, orig_y):
                             robot_x = new_x
                             moved_x = True
                         else:
-                            if robot_moved and not moved_x:
-                                debug_log.warning(
-                                    f"COLLISION blocked X: tried ({new_x:.1f},{robot_y:.1f}) "
-                                    f"vx={robot_vx:.2f} — STOP"
-                                )
-                        if not is_collision(robot_x, new_y):
+                            robot_vx = 0.0
+                        
+                        # Sprawdź niezależnie ruch po osi Y przy starej pozycji X
+                        if not is_collision(orig_x, new_y):
                             robot_y = new_y
                             moved_y = True
                         else:
-                            if robot_moved and not moved_y:
-                                debug_log.warning(
-                                    f"COLLISION blocked Y: tried ({robot_x:.1f},{new_y:.1f}) "
-                                    f"vy={robot_vy:.2f} — STOP"
-                                )
-                        robot_moved = moved_x or moved_y
-                        if not moved_x:
-                            robot_vx = 0.0
-                        if not moved_y:
                             robot_vy = 0.0
+                            
+                        robot_moved = moved_x or moved_y
                     
                     if abs(local_w) > 0.001:
                         robot_heading = new_heading
                         robot_moved = True
                     
-                    # == 📡 5. Update noisy odometry ==
-                    dist_delta = math.hypot(robot_vx, robot_vy)
-                    total_distance += dist_delta
-                    
-                    odometry_x += robot_vx + random.gauss(0, ODOMETRY_NOISE_STD)
-                    odometry_y += robot_vy + random.gauss(0, ODOMETRY_NOISE_STD)
-                    odometry_x += ODOMETRY_DRIFT_RATE * dist_delta * random.gauss(0, 1)
-                    odometry_y += ODOMETRY_DRIFT_RATE * dist_delta * random.gauss(0, 1)
-                    odometry_heading = robot_heading + random.gauss(0, GYRO_DRIFT_STD)
+                    # == 📡 5. NAPRAWIONA Odometria (Usunięto duplikację kodu) ==
                     dist_delta = math.hypot(robot_vx, robot_vy)
                     total_distance += dist_delta
                     
@@ -444,11 +418,12 @@ async def physics_loop():
 
             # --- ADAPTIVE BROADCAST ---
             with state_lock:
-                snap_x = odometry_x     # send noisy position to client
+                snap_x = odometry_x     
                 snap_y = odometry_y
                 snap_heading = odometry_heading
-                snap_true_x = robot_x   # also send true for diagnostics
+                snap_true_x = robot_x   
                 snap_true_y = robot_y
+                snap_true_heading = robot_heading # Prawdziwy kąt drona dla laserów
                 snap_maze = phys_maze
                 snap_h = phys_h
                 snap_w = phys_w
@@ -459,31 +434,26 @@ async def physics_loop():
                 snap_skidding = is_skidding
 
             if robot_moved:
-                # Full broadcast with laser data (robot is moving)
                 all_hits = []
-                h_cos = math.cos(snap_heading)
-                h_sin = math.sin(snap_heading)
                 
+                # == 📡 6. NAPRAWIONY LIDAR: Promienie rzucamy z TRUE_X / TRUE_Y drona! ==
                 for i in range(NUM_SENSORS):
-                    # Sensor mounting in global frame
-                    s_ang = snap_heading + SENSOR_ANGLES_RAD[i]
+                    s_ang = snap_true_heading + SENSOR_ANGLES_RAD[i]
                     s_cos = math.cos(s_ang)
                     s_sin = math.sin(s_ang)
-                    sx = snap_x + SENSOR_RADIUS * s_cos
-                    sy = snap_y + SENSOR_RADIUS * s_sin
+                    sx = snap_true_x + SENSOR_RADIUS * s_cos
+                    sy = snap_true_y + SENSOR_RADIUS * s_sin
                     
                     for ang_rad in ray_angles_rad:
                         r_ang = s_ang + ang_rad
                         dx = math.cos(r_ang)
                         dy = math.sin(r_ang)
                         
-                        # Single noise sample per ray
                         noise = random.gauss(0, NOISE_STD)
                         max_dist = float(SENSOR_RANGE + noise)
                         hit_dist = max_dist
                         hit = False
                         
-                        # Step by 2 — pixel-perfect not needed for 10-wide robot
                         max_steps = min(int(max_dist), SENSOR_RANGE)
                         for d in range(1, max_steps, 2):
                             cx = int(sx + dx * d)
@@ -507,7 +477,6 @@ async def physics_loop():
                     "true_x": snap_true_x, "true_y": snap_true_y
                 })
             elif now - idle_heartbeat > 1.0:
-                # Idle heartbeat — just position, no laser data (saves CPU + bandwidth)
                 idle_heartbeat = now
                 at_meta = bool(math.hypot(snap_x - snap_goal_x, snap_y - snap_goal_y) < 15.0)
                 broadcast_message({
@@ -517,7 +486,6 @@ async def physics_loop():
                     "true_x": snap_true_x, "true_y": snap_true_y
                 })
 
-        # Adaptive sleep: tight when armed, relaxed when idle
         sleep_s = 0.03 / max(0.1, local_sim_speed) if local_armed else 0.1
         await asyncio.sleep(sleep_s)
 
