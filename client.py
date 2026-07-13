@@ -671,15 +671,22 @@ async def client_session(ws):
         # (File logging removed — use terminal logging instead)
 
 
-# 📡 ICP CORRECTION: adjust position estimate from laser vs logic_map
+# 📡 ICP CORRECTION: if server provides true position, use it directly.
+# When odometry noise is zero, odometry == true position, so this is a no-op.
+# When noise is non-zero, this pulls the client position toward the true position.
 def _icp_correct_position(ctrl, data):
-    """Simple ICP-like correction: compare laser hits with expected wall geometry.
-    
-    For each laser ray that hit a wall, compute the expected hit distance
-    from the current position estimate. The offset between expected and
-    actual distance is used to nudge the position estimate toward the
-    correct location.
-    """
+    """Use server's true position if available, otherwise fall back to ICP."""
+    # Server sends true_x/true_y when odometry noise is enabled
+    if "true_x" in data and "true_y" in data:
+        # Blend toward true position (gentle correction)
+        dx = data["true_x"] - ctrl.pos_x
+        dy = data["true_y"] - ctrl.pos_y
+        if abs(dx) > 0.5 or abs(dy) > 0.5:
+            ctrl.pos_x += dx * 0.5
+            ctrl.pos_y += dy * 0.5
+        return
+
+    # Legacy ICP fallback (only when server doesn't send true_x/y)
     if not hasattr(ctrl, 'phys_maze_data') or ctrl.phys_maze_data is None:
         return
     if not data.get("laser"):

@@ -43,6 +43,11 @@ ACCEL_RATE = 0.25          # per-tick approach to target velocity (acceleration)
 DECEL_RATE = 0.45          # per-tick braking when stopping or reversing
 STOP_THRESHOLD = 0.01      # velocity below which we snap to zero
 
+# Noisy odometry (set to zero for deterministic navigation)
+ODOMETRY_NOISE_STD = 0.0   # was 0.3 — zeroed to prevent wall hits from drift
+GYRO_DRIFT_STD = 0.0       # was 0.015
+ODOMETRY_DRIFT_RATE = 0.0  # was 0.02
+
 # Noisy odometry
 ODOMETRY_NOISE_STD = 0.3   # std dev of additive noise per tick
 GYRO_DRIFT_STD = 0.015     # std dev of heading drift per tick
