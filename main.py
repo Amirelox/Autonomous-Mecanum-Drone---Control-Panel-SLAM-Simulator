@@ -360,21 +360,34 @@ async def physics_loop():
                     else:
                         is_skidding = False
                     
-                    # == 🏎️ 4. Move with collision check (no bounce) ==
+                    # == 🏎️ 4. Move with collision check (full diagonal first) ==
                     if is_skidding:
-                        robot_vx *= 0.9  # extra friction during skid
+                        robot_vx *= 0.9
                         robot_vy *= 0.9
                     
-                    if not is_collision(robot_x + robot_vx, robot_y):
-                        robot_x += robot_vx
+                    new_x = robot_x + robot_vx
+                    new_y = robot_y + robot_vy
+                    
+                    # Full diagonal check — prevents corner clipping
+                    if not is_collision(new_x, new_y):
+                        robot_x = new_x
+                        robot_y = new_y
                         robot_moved = True
                     else:
-                        robot_vx = 0.0  # STOP on wall hit — no bounce!
-                    if not is_collision(robot_x, robot_y + robot_vy):
-                        robot_y += robot_vy
-                        robot_moved = True
-                    else:
-                        robot_vy = 0.0
+                        # Fall back to individual axes
+                        moved_x = False
+                        moved_y = False
+                        if not is_collision(new_x, robot_y):
+                            robot_x = new_x
+                            moved_x = True
+                        if not is_collision(robot_x, new_y):
+                            robot_y = new_y
+                            moved_y = True
+                        robot_moved = moved_x or moved_y
+                        if not moved_x:
+                            robot_vx = 0.0
+                        if not moved_y:
+                            robot_vy = 0.0
                     
                     if abs(local_w) > 0.001:
                         robot_heading = new_heading
