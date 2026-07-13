@@ -40,7 +40,7 @@ ray_angles_rad = [math.radians(a) for a in ray_angles_deg]
 ROBOT_MASS = 1.0           # kg (lighter = more responsive)
 MAX_MOTOR_FORCE = 4.0      # N at cmd=0.6 (scaled in physics loop)
 DRAG_DECAY = 0.94          # per-tick velocity retention (0.94 → v_terminal ≈ 1.88/tick)
-MAX_GRIP = 8.0             # N (max lateral grip before skidding)
+MAX_GRIP = 8.0             # N (unused, kept for reference)
 MAX_SPEED = 3.5            # max units/tick (speed cap)
 
 # Scale: client sends 0-0.6 as velocity commands; we map 0.6 → MAX_MOTOR_FORCE

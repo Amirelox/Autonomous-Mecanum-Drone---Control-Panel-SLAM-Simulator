@@ -29,7 +29,7 @@ from config import (
     SENSOR_ANGLES_RAD, ray_angles_rad,
     # Physics & dynamics
     ROBOT_MASS, MAX_MOTOR_FORCE, DRAG_DECAY,
-    MAX_GRIP, MAX_SPEED, CMD_FORCE_SCALE,
+    MAX_SPEED, CMD_FORCE_SCALE,
     ODOMETRY_NOISE_STD, GYRO_DRIFT_STD, ODOMETRY_DRIFT_RATE
 )
 
@@ -360,11 +360,10 @@ async def physics_loop():
                         robot_vy = robot_vy / speed * MAX_SPEED
                         speed = MAX_SPEED
                     
-                    # == 🏎️ 5. Grip limit / skidding check ==
-                    if abs(local_w) > 0.001 and speed > 0.3:
-                        turn_radius = speed / abs(local_w)
-                        F_centrifugal = ROBOT_MASS * (speed/dt) * (speed/dt) / max(turn_radius, 0.1)
-                        is_skidding = F_centrifugal > MAX_GRIP
+                    # == 🏎️ 5. Grip limit / skidding check (heuristic) ==
+                    # Skid when turning sharply at speed
+                    if abs(local_w) > 0.01 and speed > 0.8:
+                        is_skidding = (speed * abs(local_w)) > 0.08
                     else:
                         is_skidding = False
                     
