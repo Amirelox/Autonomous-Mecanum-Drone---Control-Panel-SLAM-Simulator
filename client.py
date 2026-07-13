@@ -12,6 +12,8 @@ import time
 import logging
 from dotenv import load_dotenv
 
+from debug_logger import debug_log
+
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(name)s] %(levelname)s: %(message)s')
@@ -162,6 +164,13 @@ class DFSController:
                                     pass
                                 else:
                                     self.logic_map[wr][wc] = 1
+                                    debug_log.info(
+                                        f"WALL_MARKED cell=({wr},{wc}) "
+                                        f"hit_pos=({sx+dx*dist:.1f},{sy+dy*dist:.1f}) "
+                                        f"robot=({pos_x:.1f},{pos_y:.1f}) "
+                                        f"heading={math.degrees(heading):.0f}° "
+                                        f"prob={prob_map[hy, hx]:.2f} ray={i}-{j}"
+                                    )
 
     def find_next_target(self):
         """Scans adjacent nodes to select the next step for DFS exploration."""
@@ -562,7 +571,12 @@ async def client_session(ws):
                 r1, c1 = controller.current_logic_pos
                 r2, c2 = controller.target_logic
                 mid_r, mid_c = (r1 + r2) // 2, (c1 + c2) // 2
-                controller.logic_map[mid_r][mid_c] = 1 
+                controller.logic_map[mid_r][mid_c] = 1
+                debug_log.warning(
+                    f"STALL_DETECTED at cell={controller.current_logic_pos} "
+                    f"target={controller.target_logic} "
+                    f"marking mid=({mid_r},{mid_c}) as WALL"
+                )
                 if controller.target_logic in controller.visited:
                     controller.visited.remove(controller.target_logic)
                 if controller.path_stack:
@@ -627,6 +641,13 @@ async def client_session(ws):
             tx, ty = controller.target_phys
             dist_to_target = math.hypot(tx - data["pos_x"], ty - data["pos_y"])
             if dist_to_target < corner_cut_threshold:
+                debug_log.info(
+                    f"TARGET_REACHED cell={controller.target_logic} "
+                    f"dist={dist_to_target:.1f} threshold={corner_cut_threshold} "
+                    f"fast_run={controller.fast_run} "
+                    f"robot=({data['pos_x']:.1f},{data['pos_y']:.1f}) "
+                    f"target_phys=({tx:.1f},{ty:.1f})"
+                )
                 # 🟡 Track bounding box on entering new cell
                 if not controller.fast_run and controller.target_logic is not None:
                     controller.exploration_path.append(controller.target_logic)
@@ -668,7 +689,19 @@ async def client_session(ws):
         json_request = json.dumps(command)
         await ws.send(json_request)
 
-        # (File logging removed — use terminal logging instead)
+        # Log every ~10th command for debug tracing
+        if hasattr(controller, '_cmd_counter'):
+            controller._cmd_counter += 1
+        else:
+            controller._cmd_counter = 0
+        if controller._cmd_counter % 10 == 0:
+            debug_log.debug(
+                f"CMD target={controller.target_logic} "
+                f"pos=({controller.pos_x:.1f},{controller.pos_y:.1f}) "
+                f"send={json_request} "
+                f"finished={controller.finished} "
+                f"fast_run={controller.fast_run}"
+            )
 
 
 # 📡 ICP CORRECTION: if server provides true position, use it directly.

@@ -14,6 +14,8 @@ import logging
 from concurrent.futures import TimeoutError
 from dotenv import load_dotenv
 
+from debug_logger import debug_log
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(threadName)s] %(levelname)s: %(message)s')
 log = logging.getLogger(__name__)
 
@@ -353,6 +355,17 @@ async def physics_loop():
                     if abs(robot_vy) < STOP_THRESHOLD:
                         robot_vy = 0.0
                     
+                    # Log velocity changes (every ~20 ticks = ~0.6s)
+                    if random.random() < 0.05:
+                        speed = math.hypot(robot_vx, robot_vy)
+                        debug_log.debug(
+                            f"PHYSICS pos=({robot_x:.1f},{robot_y:.1f}) "
+                            f"vel=({robot_vx:.3f},{robot_vy:.3f}) "
+                            f"speed={speed:.3f} target=({target_gx:.3f},{target_gy:.3f}) "
+                            f"cmd=({local_vx:.2f},{local_vy:.2f}) "
+                            f"skid={is_skidding}"
+                        )
+                    
                     # == 🏎️ 3. Skidding check ==
                     speed = math.hypot(robot_vx, robot_vy)
                     if abs(local_w) > 0.01 and speed > 0.5:
@@ -374,15 +387,33 @@ async def physics_loop():
                         robot_y = new_y
                         robot_moved = True
                     else:
+                        # Collision! Log details for debugging
+                        if robot_moved:
+                            debug_log.warning(
+                                f"COLLISION blocked diagonal: pos=({robot_x:.1f},{robot_y:.1f}) "
+                                f"→ new=({new_x:.1f},{new_y:.1f}) vel=({robot_vx:.2f},{robot_vy:.2f})"
+                            )
                         # Fall back to individual axes
                         moved_x = False
                         moved_y = False
                         if not is_collision(new_x, robot_y):
                             robot_x = new_x
                             moved_x = True
+                        else:
+                            if robot_moved and not moved_x:
+                                debug_log.warning(
+                                    f"COLLISION blocked X: tried ({new_x:.1f},{robot_y:.1f}) "
+                                    f"vx={robot_vx:.2f} — STOP"
+                                )
                         if not is_collision(robot_x, new_y):
                             robot_y = new_y
                             moved_y = True
+                        else:
+                            if robot_moved and not moved_y:
+                                debug_log.warning(
+                                    f"COLLISION blocked Y: tried ({robot_x:.1f},{new_y:.1f}) "
+                                    f"vy={robot_vy:.2f} — STOP"
+                                )
                         robot_moved = moved_x or moved_y
                         if not moved_x:
                             robot_vx = 0.0
