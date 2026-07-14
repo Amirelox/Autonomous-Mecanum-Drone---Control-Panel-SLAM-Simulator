@@ -369,12 +369,17 @@ class RobotController:
         self.target_x = None
         self.target_y = None
         
+        # Mapa logiczna ścian (41x41 kafelków, start z (1,1))
+        self.logic_map = [[-1] * 41 for _ in range(41)]
+        self.logic_map[1][1] = 0  # Startowa komórka wolna
+        
         # Mapa i eksploracja DFS
         self.visited_cells = set()
+        self.visited_cells.add((1, 1))
         self.path_stack = []
-        self.current_cell = (0, 0)
-        self.max_r = 0
-        self.max_c = 0
+        self.current_cell = (1, 1)
+        self.max_r = 1
+        self.max_c = 1
         
         # Stan maszyny stanów
         self.exploration_done = False
@@ -417,7 +422,7 @@ class RobotController:
         print("[CONTROLLER] Resume - send neutral command to arm")
     
     def update_sensors(self):
-        """Aktualizuje dane z czujników przez ESP32."""
+        """Aktualizuje dane z czujników przez ESP32 i aktualizuje mapę logiczną."""
         if not self.sensors.initialized:
             self.sensors.init()
         
@@ -426,25 +431,70 @@ class RobotController:
         imu_data = self.sensors.read_imu()
         encoders = self.sensors.read_encoders()
         
-        # Aktualizuj pozycję (placeholder - użyj prawdziwej fuzji sensorów)
+        # Aktualizuj pozycję z danych sensorów
         pos = self.sensors.get_position_estimate()
-        self.pos_x, self.pos_y, self.heading = pos
+        new_x, new_y, new_heading = pos
+        
+        # Sprawdź czy pozycja się zmieniła (unikaj dryfu)
+        if abs(new_x - self.pos_x) > 0.1 or abs(new_y - self.pos_y) > 0.1:
+            self.pos_x = new_x
+            self.pos_y = new_y
+            self.heading = new_heading
+            
+            # Aktualizuj aktualną komórkę logiczną na podstawie pozycji
+            cell_r = int(self.pos_y / CELL_SIZE)
+            cell_c = int(self.pos_x / CELL_SIZE)
+            
+            # Sprawdź czy w granicach mapy
+            if 0 <= cell_r < 41 and 0 <= cell_c < 41:
+                self.current_cell = (cell_r, cell_c)
+                
+                # Oznacz jako odwiedzoną
+                if self.current_cell not in self.visited_cells:
+                    self.visited_cells.add(self.current_cell)
+                    self.logic_map[cell_r][cell_c] = 0  # Wolna przestrzeń
+                
+                # Aktualizuj max wymiary
+                if cell_r > self.max_r:
+                    self.max_r = cell_r
+                if cell_c > self.max_c:
+                    self.max_c = cell_c
+        
+        # TODO: Gdy API czujników będzie gotowe, użyj LiDAR do wykrywania ścian
+        # i aktualizuj logic_map[r][c] = 1 dla ścian
         
         return lidar_data, imu_data, encoders
     
     def find_next_target(self):
         """
         Znajduje następną komórkę do odwiedzenia w eksploracji DFS.
+        Sprawdza mapę logiczną ścian przed podjęciem decyzji.
         
         Returns:
             tuple: (row, col) następnej komórki lub None jeśli brak
         """
         r, c = self.current_cell
-        directions = [(-1, 0), (0, 1), (1, 0), (0, -1)]  # N, E, S, W
+        # Krok o 2 dla kafelków (pomijamy środek przejścia)
+        directions = [(-2, 0), (0, 2), (2, 0), (0, -2)]  # N, E, S, W
         
         for dr, dc in directions:
             nr, nc = r + dr, c + dc
-            if (nr, nc) not in self.visited_cells:
+            
+            # Sprawdź czy w granicach mapy
+            if not (0 <= nr < 41 and 0 <= nc < 41):
+                continue
+            
+            # Sprawdź czy przejście (środek) jest wolne od ścian
+            mid_r, mid_c = r + dr//2, c + dc//2
+            mid_free = self.logic_map[mid_r][mid_c] <= 0
+            
+            # Sprawdź czy cel jest wolny od ścian
+            target_free = self.logic_map[nr][nc] <= 0
+            
+            # Sprawdź czy nieodwiedzona
+            not_visited = (nr, nc) not in self.visited_cells
+            
+            if mid_free and target_free and not_visited:
                 return (nr, nc)
         
         # Brak nieodwiedzonych sąsiadów - cofnij się
@@ -456,6 +506,7 @@ class RobotController:
     def compute_shortest_path(self, start, goal):
         """
         Oblicza najkrótszą ścieżkę BFS od start do goal.
+        Sprawdza mapę logiczną ścian przed podjęciem decyzji.
         
         Args:
             start: (row, col) komórki startowej
@@ -475,11 +526,26 @@ class RobotController:
             if (r, c) == goal:
                 return path
             
-            for dr, dc in [(-1, 0), (0, 1), (1, 0), (0, -1)]:
+            # Krok o 2 dla kafelków
+            for dr, dc in [(-2, 0), (0, 2), (2, 0), (0, -2)]:
                 nr, nc = r + dr, c + dc
-                if (nr, nc) not in visited and (nr, nc) in self.visited_cells:
+                
+                # Sprawdź czy w granicach mapy
+                if not (0 <= nr < 41 and 0 <= nc < 41):
+                    continue
+                
+                # Sprawdź czy przejście (środek) jest wolne
+                mid_r, mid_c = r + dr//2, c + dc//2
+                mid_free = self.logic_map[mid_r][mid_c] == 0
+                
+                # Sprawdź czy cel jest wolny
+                target_free = self.logic_map[nr][nc] == 0
+                
+                if mid_free and target_free and (nr, nc) not in visited:
                     visited.add((nr, nc))
                     queue.append(((nr, nc), path + [(nr, nc)]))
+        
+        return []  # Brak ścieżki
         
         return []  # Brak ścieżki
     
