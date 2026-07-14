@@ -7,3 +7,8 @@ trash py/
 backup/
 todo.md
 .txt
+api.md
+secrets.py
+micropython_client.py
+README_micropython.md
+secrets_template.py
