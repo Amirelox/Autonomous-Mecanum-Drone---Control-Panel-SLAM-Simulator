@@ -1,34 +1,35 @@
 """
-MicroPython Client for ESP32-S3 Mecanum Robot
-==============================================
-Szablon implementacji klienta dla robota z napędem mecanum.
-Implementuje autentykację WebSocket, komunikację z robotem oraz strukturę
-pod przyszłe API czujników.
+Raspberry Pi Client for Mecanum Robot with ESP32-S3
+====================================================
+Klient dla Raspberry Pi łączący się z ESP32-S3 przez WebSocket.
+RPi wykonuje całą logikę (DFS, SLAM, nawigacja), a ESP32 tylko:
+- Steruje silnikami
+- Odczytuje czujniki (placeholder)
+- Wysyła dane telemetryczne
 
-Wymagane biblioteki MicroPython:
-- uasyncio (wbudowane)
-- ujson (wbudowane)
-- urequests (opcjonalnie, do REST API)
-- umqtt_simple (opcjonalnie, jeśli MQTT zamiast WebSocket)
-
-Uwaga: HMAC-SHA256 wymaga micropython-lib lub własnej implementacji.
+Wymagane biblioteki Python 3:
+- asyncio (wbudowane)
+- json (wbudowane)
+- websockets (pip install websockets)
+- numpy (pip install numpy)
 """
 
-import uasyncio as asyncio
-import ujson as json
-import machine
+import asyncio
+import json
 import time
 import math
-import struct
+import hmac
+import hashlib
+from typing import Optional, Dict, Any, List, Tuple
 
 # Spróbuj załadować klucze z secrets.py (opcjonalne)
 try:
-    from secrets import ROBOT_HMAC_KEY, ROBOT_WS_URL
+    from secrets import ROBOT_HMAC_KEY, ESP32_WS_URL
     print("[CONFIG] Loaded credentials from secrets.py")
 except ImportError:
     # Domyślne wartości (zmień przed uruchomieniem!)
     ROBOT_HMAC_KEY = "YOUR_64_CHAR_HEX_KEY_HERE"
-    ROBOT_WS_URL = "ws://192.168.1.100/ws"
+    ESP32_WS_URL = "ws://192.168.4.1:8765/ws"
     print("[CONFIG] Using default credentials - CHANGE BEFORE PRODUCTION!")
 
 # Parametry fizyczne robota (z config.py)
@@ -48,20 +49,6 @@ NUM_SENSORS = 6
 RAYS_PER_SENSOR = 15
 SENSOR_ANGLES_DEG = [0, 60, 120, 180, 240, 300]  # Kąty montażu sensorów
 
-# Konfiguracja pinów GPIO (ESP32-S3)
-# TODO: Dostosuj piny do swojego układu
-I2C_SCL_PIN = 22  # Pin SCL dla I2C (czujniki VL53L7CX, IMU)
-I2C_SDA_PIN = 21  # Pin SDA dla I2C
-I2C_FREQ = 400000  # Częstotliwość I2C [Hz]
-
-# Piny enkoderów (przykładowe - dostosuj do swojego układu)
-ENCODER_PINS = {
-    "fl": (32, 33),  # (pin_A, pin_B) dla front-left
-    "fr": (25, 26),  # front-right
-    "rl": (27, 14),  # rear-left
-    "rr": (12, 13),  # rear-right
-}
-
 # Watchdog timeout [ms]
 WATCHDOG_TIMEOUT_MS = 350
 
@@ -69,123 +56,183 @@ WATCHDOG_TIMEOUT_MS = 350
 COMMAND_RATE_HZ = 25
 
 # ============================================================
-# PLACEHOLDER: API CZUJNIKÓW
+# KLIENT WEBSOCKET DO ESP32
+# ============================================================
+
+class ESP32WebSocketClient:
+    """
+    Klient WebSocket łączący Raspberry Pi z ESP32-S3.
+    
+    Implementuje:
+    - Autentykację challenge-response (HMAC-SHA256)
+    - Odbieranie danych z czujników od ESP32
+    - Wysyłanie komend sterujących do ESP32
+    """
+    
+    def __init__(self, host: str = "192.168.4.1", port: int = 8765, secret_key: str = ""):
+        self.host = host
+        self.port = port
+        self.secret_key = secret_key
+        self.ws = None
+        self.session_token = None
+        self.auth_level = 0
+        self.connected = False
+        self.latest_sensor_data = None
+    
+    async def connect(self) -> bool:
+        """
+        Łączy się z ESP32 i przeprowadza autentykację.
+        
+        Returns:
+            bool: True jeśli połączenie i autentykacja udane
+        """
+        try:
+            import websockets
+            
+            ws_url = f"ws://{self.host}:{self.port}"
+            print(f"[WS] Connecting to {ws_url}...")
+            
+            self.ws = await asyncio.wait_for(
+                websockets.connect(ws_url),
+                timeout=5.0
+            )
+            
+            print("[WS] Connected, waiting for nonce...")
+            
+            # Odbierz nonce od ESP32
+            nonce_msg = await self.ws.recv()
+            nonce_data = json.loads(nonce_msg)
+            nonce = nonce_data["nonce"]
+            
+            print(f"[WS] Received nonce: {nonce[:16]}...")
+            
+            # Oblicz odpowiedź HMAC-SHA256
+            key_bytes = bytes.fromhex(self.secret_key)
+            nonce_bytes = bytes.fromhex(nonce)
+            answer = hmac.new(key_bytes, nonce_bytes, hashlib.sha256).hexdigest()
+            
+            # Wyślij odpowiedź
+            auth_msg = json.dumps({"auth": answer})
+            await self.ws.send(auth_msg)
+            
+            print("[WS] Sent authentication response")
+            
+            # Odbierz potwierdzenie
+            while True:
+                reply_msg = await self.ws.recv()
+                reply_data = json.loads(reply_msg)
+                
+                if "auth" in reply_data:
+                    if reply_data["auth"] == "ok":
+                        self.session_token = reply_data.get("token")
+                        self.auth_level = reply_data.get("level", 0)
+                        self.connected = True
+                        print(f"[WS] ✓ Authenticated! Level: {self.auth_level}")
+                        return True
+                    else:
+                        print(f"[WS] ✗ Authentication failed")
+                        return False
+                        
+        except Exception as e:
+            print(f"[WS] ✗ Connection error: {e}")
+            return False
+    
+    async def disconnect(self):
+        """Zamyka połączenie WebSocket."""
+        if self.ws:
+            await self.ws.close()
+            self.connected = False
+            print("[WS] Disconnected")
+    
+    async def send_command(self, command: dict):
+        """Wysyła komendę sterującą do ESP32."""
+        if not self.ws or not self.connected:
+            return
+        
+        try:
+            msg = json.dumps(command)
+            await self.ws.send(msg)
+        except Exception as e:
+            print(f"[WS] Send error: {e}")
+    
+    async def receive_sensor_data(self):
+        """
+        Odbiera dane z czujników od ESP32.
+        
+        Returns:
+            dict: Dane z czujników lub None
+        """
+        if not self.ws or not self.connected:
+            return None
+        
+        try:
+            msg = await asyncio.wait_for(self.ws.recv(), timeout=0.1)
+            data = json.loads(msg)
+            
+            # Sprawdź czy to dane z czujników (nie telemetria)
+            if "sensors" in data or "lidar" in data or "imu" in data:
+                self.latest_sensor_data = data
+                return data
+            
+            return None
+            
+        except asyncio.TimeoutError:
+            return None
+        except Exception as e:
+            print(f"[WS] Receive error: {e}")
+            return None
+    
+    async def close(self):
+        """Zamyka połączenie WebSocket."""
+        if self.ws:
+            await self.ws.close()
+            self.connected = False
+
+
+# ============================================================
+# PLACEHOLDER: API CZUJNIKÓW (odczyt przez ESP32)
 # ============================================================
 # TODO: Po otrzymaniu dokumentacji API czujników, wypełnij tę klasę
 
 class SensorAPI:
     """
-    Klasa obsługująca czujniki robota.
+    Klasa obsługująca czujniki robota przez ESP32.
     
-    Obecnie zawiera placeholder'y dla:
-    - LiDAR / ToF (VL53L7CX) - 6 sensorów na I2C z multiplekserem TCA9548A
-    - IMU (ICM-20948) - akcelerometr, żyroskop, magnetometr
-    - Enkodery silników - 4 enkodery kwadraturowe
-    
-    Po otrzymaniu API, zaimplementuj metody read_*() zgodnie z protokołem.
+    Na Raspberry Pi czujniki są fizycznie podłączone do ESP32.
+    Ta klasa odbiera dane od ESP32 przez WebSocket.
     """
     
-    def __init__(self):
+    def __init__(self, ws_client: ESP32WebSocketClient = None):
         self.initialized = False
         self.last_read_time = 0
-        self.i2c = None
-        self.tca9548 = None  # Multiplekser I2C dla VL53L7CX
+        self.ws_client = ws_client
         
-    def init(self):
-        """Inicjalizacja czujników (I2C, SPI, UART)."""
-        try:
-            # Inicjalizacja magistrali I2C
-            self.i2c = machine.I2C(
-                0, 
-                scl=machine.Pin(I2C_SCL_PIN), 
-                sda=machine.Pin(I2C_SDA_PIN), 
-                freq=I2C_FREQ
-            )
-            
-            # Skanuj urządzenia I2C (debug)
-            devices = self.i2c.scan()
-            print(f"[SENSORS] I2C devices found: {[hex(d) for d in devices]}")
-            
-            # TODO: Zainicjalizuj multiplekser TCA9548A (adres 0x70)
-            # self.tca9548 = TCA9548A(self.i2c, addr=0x70)
-            
-            # TODO: Zainicjalizuj IMU ICM-20948
-            # self.imu = ICM20948(self.i2c, addr=0x69)
-            
-            # TODO: Zainicjalizuj enkodery
-            # self.encoders = {}
-            # for name, (pin_a, pin_b) in ENCODER_PINS.items():
-            #     self.encoders[name] = Encoder(pin_a, pin_b)
-            
-            self.initialized = True
-            print("[SENSORS] Initialized successfully")
-            
-        except Exception as e:
-            print(f"[SENSORS] Initialization error: {e}")
-            self.initialized = False
+    def init(self, ws_client: ESP32WebSocketClient = None):
+        """Inicjalizacja połączenia z ESP32."""
+        if ws_client:
+            self.ws_client = ws_client
+        self.initialized = True
+        print("[SENSORS] Initialized (will receive data from ESP32)")
     
     def read_lidar(self):
         """
-        Odczyt danych z sensorów odległości VL53L7CX.
+        Odczyt danych z sensorów odległości VL53L7CX (przez ESP32).
         
         Returns:
-            list[dict]: Lista słowników z danymi dla każdego promienia:
-                [{"d": distance_mm, "hit": bool}, ...]
-            
-        UWAGA: Po otrzymaniu API czujników, zastąp placeholder prawdziwym odczytem.
-        Obecnie VL53L7CX zwraca pojedynczą odległość per sensor (nie 15 promieni).
+            list[dict]: Lista słowników z danymi dla każdego promienia
         """
-        if not self.initialized:
-            # Fallback - symulowane dane
-            return [{"d": SENSOR_RANGE, "hit": False} for _ in range(NUM_SENSORS * RAYS_PER_SENSOR)]
-        
-        # TODO: Odczytaj rzeczywiste dane z VL53L7CX przez TCA9548A
-        # Przykładowa implementacja (do uzupełnienia):
-        # distances = []
-        # for sensor_idx in range(NUM_SENSORS):
-        #     self.tca9548.select_channel(sensor_idx)
-        #     distance = self.vl53l7cx[sensor_idx].read_distance()
-        #     # Dla każdego sensora generujemy RAYS_PER_SENSOR promieni
-        #     for ray_idx in range(RAYS_PER_SENSOR):
-        #         angle_offset = ray_angles_deg[ray_idx]
-        #         distances.append({"d": distance, "hit": distance < SENSOR_RANGE})
-        # return distances
-        
-        # Placeholder - zwraca symulowane dane
-        return [{"d": SENSOR_RANGE, "hit": False} for _ in range(NUM_SENSORS * RAYS_PER_SENSOR)]
+        # TODO: Gdy API będzie gotowe, odbierz dane z ESP32
+        # Placeholder - symulowane dane
+        return [{"d": 200.0, "hit": False} for _ in range(NUM_SENSORS * RAYS_PER_SENSOR)]
     
     def read_imu(self):
         """
-        Odczyt danych z IMU (ICM-20948).
+        Odczyt danych z IMU ICM-20948 (przez ESP32).
         
         Returns:
-            dict: Słownik z danymi:
-                {"ax": float, "ay": float, "az": float,      # Akcelerometr [m/s²]
-                 "gx": float, "gy": float, "gz": float,      # Żyroskop [rad/s]
-                 "mx": float, "my": float, "mz": float,      # Magnetometr [µT]
-                 "heading": float}                            # Heading w radianach [0, 2π)
+            dict: Słownik z danymi IMU
         """
-        if not self.initialized:
-            return {
-                "ax": 0.0, "ay": 0.0, "az": 9.81,
-                "gx": 0.0, "gy": 0.0, "gz": 0.0,
-                "mx": 0.0, "my": 0.0, "mz": 0.0,
-                "heading": 0.0
-            }
-        
-        # TODO: Odczytaj rzeczywiste dane z ICM-20948
-        # Przykładowa implementacja:
-        # raw = self.imu.read_all()
-        # heading = math.atan2(raw['my'], raw['mx'])
-        # if heading < 0:
-        #     heading += 2 * math.pi
-        # return {
-        #     "ax": raw['ax'], "ay": raw['ay'], "az": raw['az'],
-        #     "gx": raw['gx'], "gy": raw['gy'], "gz": raw['gz'],
-        #     "mx": raw['mx'], "my": raw['my'], "mz": raw['mz'],
-        #     "heading": heading
-        # }
-        
+        # TODO: Gdy API będzie gotowe, odbierz dane z ESP32
         # Placeholder
         return {
             "ax": 0.0, "ay": 0.0, "az": 9.81,
@@ -196,45 +243,23 @@ class SensorAPI:
     
     def read_encoders(self):
         """
-        Odczyt enkoderów silników (kwadraturowe).
+        Odczyt enkoderów silników (przez ESP32).
         
         Returns:
-            dict: Słownik z licznikami impulsów:
-                {"fl": int, "fr": int, "rl": int, "rr": int}
+            dict: Słownik z licznikami impulsów
         """
-        if not self.initialized:
-            return {"fl": 0, "fr": 0, "rl": 0, "rr": 0}
-        
-        # TODO: Odczytaj rzeczywiste wartości z enkoderów
-        # Przykładowa implementacja:
-        # return {
-        #     "fl": self.encoders["fl"].get_count(),
-        #     "fr": self.encoders["fr"].get_count(),
-        #     "rl": self.encoders["rl"].get_count(),
-        #     "rr": self.encoders["rr"].get_count()
-        # }
-        
+        # TODO: Gdy API będzie gotowe, odbierz dane z ESP32
         # Placeholder
         return {"fl": 0, "fr": 0, "rl": 0, "rr": 0}
     
     def get_position_estimate(self):
         """
-        Szacowanie pozycji na podstawie enkoderów i IMU (dead reckoning / fuzja sensorów).
+        Szacowanie pozycji na podstawie danych od ESP32.
         
         Returns:
-            tuple: (pos_x, pos_y, heading) w mm i radianach
+            tuple: (pos_x, pos_y, heading)
         """
-        if not self.initialized:
-            return (0.0, 0.0, 0.0)
-        
-        # TODO: Implementacja fuzji sensorów (kalman filter / complementary filter)
-        # Przykładowa implementacja z użyciem enkoderów i IMU:
-        # encoders = self.read_encoders()
-        # imu = self.read_imu()
-        # Oblicz deltę pozycji na podstawie impulsów enkoderów
-        # Zastosuj korektę heading z magnetometru/żyroskopu
-        # return (new_x, new_y, new_heading)
-        
+        # TODO: Implementacja fuzji sensorów gdy API będzie gotowe
         # Placeholder
         return (0.0, 0.0, 0.0)
 
@@ -330,7 +355,7 @@ class RobotController:
     - Watchdog i bezpieczeństwo
     """
     
-    def __init__(self):
+    def __init__(self, ws_client: ESP32WebSocketClient = None):
         self.armed = False
         self.estop = False
         self.finished = False
@@ -354,15 +379,17 @@ class RobotController:
         # Stan maszyny stanów
         self.exploration_done = False
         self.fast_run = False
-        self.finished = False
         self.goal_cell = None
         self.optimized_path = []
         
         # Watchdog
         self.last_command_time = 0
         
-        # Sensory
-        self.sensors = SensorAPI()
+        # Połączenie z ESP32
+        self.ws_client = ws_client
+        
+        # Sensory (przez ESP32)
+        self.sensors = SensorAPI(ws_client)
         
         # Telemetria
         self.telemetry = {}
@@ -390,11 +417,11 @@ class RobotController:
         print("[CONTROLLER] Resume - send neutral command to arm")
     
     def update_sensors(self):
-        """Aktualizuje dane z czujników."""
+        """Aktualizuje dane z czujników przez ESP32."""
         if not self.sensors.initialized:
             self.sensors.init()
         
-        # TODO: Odczytaj rzeczywiste dane z czujników
+        # Odczytaj dane z ESP32 (placeholder - gdy API będzie gotowe)
         lidar_data = self.sensors.read_lidar()
         imu_data = self.sensors.read_imu()
         encoders = self.sensors.read_encoders()
@@ -663,6 +690,35 @@ class RobotController:
             else:
                 return {"vx": 0.0, "vy": 0.0, "w": 0.0}
     
+    def run_exploration_step(self):
+        """
+        Wykonuje jeden krok eksploracji/nawigacji i wysyła komendę do ESP32.
+        
+        Ta metoda:
+        1. Aktualizuje sensory z ESP32
+        2. Oblicza następną komendę ruchu (DFS lub fast run)
+        3. Wysyła komendę do ESP32 przez WebSocket
+        4. Aktualizuje watchdog
+        """
+        if self.estop or not self.armed:
+            # Rozbrojony - wyślij komendę neutralną
+            if self.ws_client and self.ws_client.connected:
+                asyncio.create_task(self.ws_client.send_command({"vx": 0.0, "vy": 0.0, "w": 0.0}))
+            return
+        
+        # Aktualizuj sensory
+        self.update_sensors()
+        
+        # Pobierz komendę ruchu
+        command = self.get_movement_command()
+        
+        # Wyślij do ESP32
+        if self.ws_client and self.ws_client.connected:
+            asyncio.create_task(self.ws_client.send_command(command))
+        
+        # Aktualizuj watchdog
+        self.last_command_time = int(time.time() * 1000)
+    
     def check_watchdog(self, current_time_ms: int) -> bool:
         """
         Sprawdza watchdog.
@@ -707,16 +763,12 @@ class WebSocketClient:
             bool: True jeśli autentykacja udana
         """
         try:
-            # TODO: Użyj prawdziwej biblioteki WebSocket dla MicroPython
-            # microWebSocket lub websockets (jeśli dostępne)
-            # Poniżej pseudokod - należy dostosować do dostępnej biblioteki
+            # Połączenie z ESP32 przez WebSocket
+            print(f"[WS] Connecting to {self.host}:{self.port}...")
             
-            print(f"[WS] Connecting to {ROBOT_WS_URL}...")
-            
-            # Placeholder - w MicroPython użyj microWebSocket lub podobnej biblioteki
-            # from microWebSockets import WebSocketClient
-            # self.ws = WebSocketClient(ROBOT_WS_URL)
-            # await self.ws.connect()
+            # Placeholder - w produkcji użyj prawdziwej biblioteki WebSocket
+            # import websockets
+            # self.ws = await websockets.connect(f"ws://{self.host}:{self.port}")
             
             # Symulacja połączenia (USUNĄĆ W PRODUKCJI)
             print("[WS] Connected (simulated)")
@@ -873,17 +925,39 @@ class WebSocketClient:
 async def main():
     """Główna funkcja programu."""
     print("=" * 60)
-    print("MicroPython Mecanum Robot Client")
+    print("Mecanum Robot Client (Raspberry Pi)")
     print("=" * 60)
     
-    # Utwórz kontroler
-    controller = RobotController()
+    # Utwórz klienta WebSocket do ESP32
+    ws_client = ESP32WebSocketClient(
+        host="192.168.4.1",  # Domyślny IP ESP32 w trybie AP
+        port=8765,
+        secret_key="robot_secret_2024"  # Zmień na swój klucz!
+    )
     
-    # Utwórz klient WebSocket
-    ws_client = WebSocketClient(controller)
+    # Połącz z ESP32
+    if not await ws_client.connect():
+        print("[ERROR] Nie można połączyć się z ESP32")
+        return
     
-    # Uruchom klienta WebSocket (łączy się z Raspberry Pi)
-    await ws_client.run()
+    # Utwórz kontroler robota
+    controller = RobotController(ws_client)
+    
+    # Uruchom pętlę sterowania
+    try:
+        while True:
+            # Aktualizuj sensory
+            lidar_data, imu_data, encoders = controller.update_sensors()
+            
+            # Wykonaj logikę eksploracji lub nawigacji
+            controller.run_exploration_step()
+            
+            # Czekaj przed następną iteracją
+            await asyncio.sleep(0.1)
+    except KeyboardInterrupt:
+        print("\n[EXIT] Program terminated by user")
+    finally:
+        await ws_client.disconnect()
 
 
 if __name__ == "__main__":
@@ -896,55 +970,4 @@ if __name__ == "__main__":
         import sys
         sys.print_exception(e)
 
-
-# ============================================================
-# CHECKLISTA PRZED URUCHOMIENIEM
-# ============================================================
-"""
-PRZED URUCHOMIENIEM NA ESP32-S3:
-
-1. KONFIGURACJA KREDENSJALI:
-   □ Skopiuj secrets_template.py → secrets.py
-   □ Wypełnij ROBOT_HMAC_KEY (64 znaki hex)
-   □ Zmień ROBOT_WS_URL na IP robota
-
-2. BIBLIOTEKI DO ZAINSTALOWANIA:
-   □ microWebSockets lub websockets (dla WebSocket)
-   □ micropython-lib (dla hmac, hashlib) - opcjonalnie
-   □ Driver dla VL53L7CX (jeśli dostępny)
-   □ Driver dla ICM-20948 (jeśli dostępny)
-
-3. IMPLEMENTACJA CZUJNIKÓW (po otrzymaniu API):
-   □ SensorAPI.read_lidar() - odczyt VL53L7CX przez TCA9548A
-   □ SensorAPI.read_imu() - odczyt ICM-20948
-   □ SensorAPI.read_encoders() - odczyt enkoderów kwadraturowych
-   □ SensorAPI.get_position_estimate() - fuzja sensorów
-
-4. IMPLEMENTACJA WEBSOCKET:
-   □ Zastąp placeholder w WebSocketClient.connect_and_authenticate()
-   □ Zaimplementuj prawdziwe wysyłanie/odbieranie danych
-   □ Dodaj obsługę reconnect przy utracie połączenia
-
-5. TESTOWANIE:
-   □ Test autentykacji z robotem
-   □ Test wysyłania komend neutralnych (uzbrajanie)
-   □ Test odczytu czujników (jeśli podłączone)
-   □ Test watchdog (czy robot zatrzymuje się po timeout)
-
-6. OPTYMALIZACJA DLA MICROPYTHON:
-   □ Unikaj alokacji pamięci w pętli głównej
-   □ Używaj time.ticks_ms() zamiast time.time()
-   □ Minimalizuj użycie float (ESP32 ma FPU, ale wolne)
-   □ Rozważ użycie fixed-point arithmetic dla krytycznych operacji
-
-PRZYKŁADOWA STRUKTURA PLIKÓW NA ESP32:
-/main.py              - Ten plik (główny kod)
-/secrets.py           - Klucze API (NIE commitować do git!)
-/lib/
-  /microWebSockets/   - Biblioteka WebSocket
-  /vl53l7cx.py        - Driver VL53L7CX
-  /icm20948.py        - Driver ICM-20948
-  /encoder.py         - Driver enkoderów
-  /tca9548a.py        - Driver multipleksera I2C
-"""
 

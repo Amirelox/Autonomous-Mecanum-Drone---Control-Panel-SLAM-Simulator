@@ -23,7 +23,9 @@
 
 ## 🔧 KROK 1: Przygotowanie ESP32-S3
 
-### 1.1 Flash MicroPython
+### 1.1 Flash MicroPython na ESP32
+
+ESP32 musi mieć wgrany firmware z serwerem WebSocket i obsługą czujników.
 
 ```bash
 # Pobierz firmware MicroPython dla ESP32-S3
@@ -36,18 +38,194 @@ esptool.py --port COM3 erase_flash
 esptool.py --port COM3 write_flash -z 0x1000 esp32s3-*.bin
 ```
 
-### 1.2 Zainstaluj biblioteki
+### 1.2 Skonfiguruj ESP32
 
-Połącz się z REPL ESP32 przez serial (Thonny IDE lub PuTTY):
+Na ESP32 musi być uruchomiony:
+- Serwer WebSocket na porcie 8765
+- Tryb Access Point (AP) lub połączenie do WiFi
+- Obsługa autentykacji HMAC-SHA256
+- Sterowanie silnikami i odczyt czujników
 
-```python
-# Sprawdź dostępne moduły
-import uasyncio
-import ujson
-print("OK")
+**Uwaga:** Kod dla ESP32 jest w osobnym repozytorium/pliku. Ten folder zawiera kod dla **Raspberry Pi**.
+
+---
+
+## 💻 KROK 2: Konfiguracja (Raspberry Pi lub Laptop)
+
+### 2.1 Zainstaluj Python i zależności
+
+**Na Raspberry Pi (Linux):**
+```bash
+# Aktualizuj system
+sudo apt update && sudo apt upgrade -y
+
+# Zainstaluj Python 3.9+
+sudo apt install python3 python3-pip -y
+
+# Przejdź do folderu projektu
+cd ~/JPP/micropython
+
+# Zainstaluj wymagane biblioteki
+pip3 install -r requirements.txt
 ```
 
-### 1.3 Wgraj pliki na ESP32
+**Na Laptopie (Windows):**
+```powershell
+# Upewnij się że masz Python 3.9+ zainstalowany
+python --version
+
+# Przejdź do folderu projektu
+cd C:\Users\amirm\Desktop\Pulpit\Nauka\JPP\micropython
+
+# Zainstaluj wymagane biblioteki
+pip install -r requirements.txt
+```
+
+### 2.2 Skonfiguruj połączenie z ESP32
+
+Edytuj plik `main.py` i ustaw parametry połączenia:
+
+```python
+ws_client = ESP32WebSocketClient(
+    host="192.168.4.1",  # IP ESP32 w trybie AP
+    port=8765,
+    secret_key="robot_secret_2024"  # TEN SAM KLUCZ CO NA ESP32!
+)
+```
+
+**Ważne:** Klucz `secret_key` musi być identyczny na obu urządzeniach!
+
+### 2.3 Połącz się z siecią ESP32
+
+Jeśli ESP32 działa w trybie Access Point:
+1. Na laptopie/RPi połącz się z siecią WiFi utworzoną przez ESP32
+2. Domyślnie ESP32 tworzy sieć "MecanumRobot" (sprawdź konfigurację ESP32)
+3. Hasło jest ustawione w kodzie ESP32
+
+Jeśli oba urządzenia są w tej samej sieci WiFi:
+1. Upewnij się że laptop/RPi i ESP32 są w tej samej sieci
+2. Znajdź IP ESP32 (np. przez router lub skaner sieci)
+3. Zaktualizuj `host` w `main.py`
+
+---
+
+## 🚀 KROK 3: Uruchomienie
+
+### 3.1 Uruchom klienta
+
+**Na Raspberry Pi:**
+```bash
+cd ~/JPP/micropython
+python3 main.py
+```
+
+**Na Laptopie (Windows):**
+```powershell
+cd C:\Users\amirm\Desktop\Pulpit\Nauka\JPP\micropython
+python main.py
+```
+
+Powinieneś zobaczyć:
+```
+============================================================
+Mecanum Robot Client (Raspberry Pi)
+============================================================
+[WS] Connecting to 192.168.4.1:8765...
+[WS] Connected (simulated)
+[SENSORS] Initialized (will receive data from ESP32)
+```
+
+### 3.2 Otwórz dashboard
+
+W przeglądarce otwórz:
+```
+http://localhost:8080
+```
+
+Dashboard pokaże:
+- Widok "Real World" - symulacja pozycji robota
+- Widok "SLAM Grid" - mapa probabilistyczna
+- Panel sterowania - uzbrajanie, E-stop, prędkość
+- Telemetria - pozycja, heading, status
+
+---
+
+## 🔍 Rozwiązywanie problemów
+
+### Problem: Nie można połączyć się z ESP32
+
+**Rozwiązanie:**
+1. Sprawdź czy ESP32 jest włączone i działa
+2. Sprawdź czy laptop/RPi jest połączone z tą samą siecią co ESP32
+3. **Na Windows:** Sprawdź firewall:
+   ```powershell
+   # Dodaj regułę firewall dla portu 8765
+   New-NetFirewallRule -DisplayName "ESP32 WebSocket" -Direction Inbound -LocalPort 8765 -Protocol TCP -Action Allow
+   ```
+4. Przetestuj połączenie:
+   ```powershell
+   ping 192.168.4.1
+   ```
+
+### Problem: Błąd autentykacji
+
+**Rozwiązanie:**
+1. Upewnij się że `secret_key` jest taki sam na obu urządzeniach
+2. Sprawdź czy zegary są zsynchronizowane (nonce ma timeout)
+3. Sprawdź logi na ESP32 (przez serial)
+
+### Problem: Dashboard nie działa
+
+**Rozwiązanie:**
+1. Sprawdź czy NiceGUI jest zainstalowane:
+   ```bash
+   pip3 list | grep nicegui
+   ```
+2. Sprawdź czy port 8080 nie jest zajęty:
+   ```bash
+   sudo lsof -i :8080
+   ```
+3. Spróbuj innego portu w `dashboard.py`
+
+---
+
+## 📊 Monitorowanie
+
+### Logi systemu
+
+Klient wypisuje logi w terminalu:
+- `[WS]` - komunikacja WebSocket
+- `[SENSORS]` - dane z czujników
+- `[CONTROL]` - komendy sterujące
+- `[SLAM]` - aktualizacje mapy
+
+### Telemetria w czasie rzeczywistym
+
+Dashboard pokazuje:
+- Pozycję robota (x, y, heading)
+- Status uzbrojenia (armed/disarmed)
+- E-stop status
+- Prędkość maksymalną
+- Dane z czujników (gdy API będzie gotowe)
+
+---
+
+## ⚠️ Bezpieczeństwo
+
+1. **Zawsze testuj na pustej przestrzeni** - robot może się poruszać nieprzewidywalnie
+2. **Miej pod ręką przycisk E-stop** - w dashboardzie lub fizyczny przycisk
+3. **Sprawdź watchdog** - robot powinien zatrzymać się po utracie połączenia
+4. **Testuj najpierw z niską prędkością** - zacznij od 10-20% mocy
+
+---
+
+## 🔄 Następne kroki
+
+Gdy ESP32 będzie miał pełne API czujników:
+1. Zaimplementuj odbieranie danych z VL53L7CX
+2. Dodaj obsługę IMU ICM-20948
+3. Zaimplementuj fuzję sensorów dla lepszej estymacji pozycji
+4. Dodaj kalibrację czujników
 
 Użyj Thonny IDE lub `ampy`:
 
