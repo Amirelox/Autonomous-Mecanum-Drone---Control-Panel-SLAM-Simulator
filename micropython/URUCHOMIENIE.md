@@ -111,42 +111,65 @@ Jeśli oba urządzenia są w tej samej sieci WiFi:
 
 ## 🚀 KROK 3: Uruchomienie
 
-### 3.1 Uruchom klienta
+### 3.1 Uruchom dashboard rzeczywistego robota
 
 **Na Raspberry Pi:**
 ```bash
 cd ~/JPP/micropython
-python3 main.py
+python3 real_robot_dashboard.py
 ```
 
 **Na Laptopie (Windows):**
 ```powershell
 cd C:\Users\amirm\Desktop\Pulpit\Nauka\JPP\micropython
-python main.py
+python real_robot_dashboard.py
 ```
+
+Dashboard uruchomi się na porcie **8081** i automatycznie:
+1. Połączy się z ESP32 przez WebSocket (port 8765)
+2. Uzbroi robota
+3. Rozpocznie automatyczną eksplorację DFS
 
 Powinieneś zobaczyć:
 ```
 ============================================================
 Mecanum Robot Client (Raspberry Pi)
 ============================================================
-[WS] Connecting to 192.168.4.1:8765...
-[WS] Connected (simulated)
+[WS] Connecting to ws://192.168.4.1:8765...
+[WS] Connected, waiting for nonce...
+[WS] ✓ Authenticated! Level: 2
 [SENSORS] Initialized (will receive data from ESP32)
 ```
 
-### 3.2 Otwórz dashboard
+### 3.2 Otwórz dashboard w przeglądarce
 
 W przeglądarce otwórz:
 ```
-http://localhost:8080
+http://localhost:8081
 ```
 
 Dashboard pokaże:
-- Widok "Real World" - symulacja pozycji robota
-- Widok "SLAM Grid" - mapa probabilistyczna
-- Panel sterowania - uzbrajanie, E-stop, prędkość
-- Telemetria - pozycja, heading, status
+- **Mapa SLAM** - wizualizacja odwiedzonych komórek i ścian
+- **Telemetria** - pozycja, heading, status uzbrojenia
+- **Faza** - EXPLORATION → FAST RUN
+- **Panel sterowania** - przyciski ARM, DISARM, E-STOP, START
+
+### 3.3 Automatyczna sekwencja
+
+Po połączeniu z ESP32 dashboard automatycznie:
+1. ✅ Uzbraja robota (wysyła 10 komend neutralnych)
+2. ✅ Rozpoczyna eksplorację DFS
+3. ✅ Robot odwiedza wszystkie dostępne komórki
+4. ✅ Po zakończeniu DFS wraca do startu (0, 0)
+5. ✅ Oblicza optymalną ścieżkę BFS do narożnika
+6. ✅ Wykonuje fast run do celu
+
+### 3.4 Alternatywnie: Uruchom tylko klienta (bez dashboardu)
+
+Jeśli chcesz uruchomić tylko logikę bez UI:
+```bash
+python main.py
+```
 
 ---
 

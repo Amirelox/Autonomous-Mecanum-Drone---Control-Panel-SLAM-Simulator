@@ -88,14 +88,26 @@ ws_client = ESP32WebSocketClient(
 )
 ```
 
-### 3. Uruchom klienta
+### 3. Uruchom dashboard rzeczywistego robota
 
 ```bash
 cd micropython
-python main.py
+python real_robot_dashboard.py
 ```
 
-Dashboard będzie dostępny pod adresem: http://localhost:8080
+Dashboard uruchomi się na porcie **8081** i automatycznie:
+- Połączy się z ESP32
+- Uzbroi robota
+- Rozpocznie automatyczną eksplorację DFS
+- Po zakończeniu wykona fast run BFS do narożnika
+
+Otwórz w przeglądarce: http://localhost:8081
+
+### Alternatywnie: Uruchom tylko klienta (bez UI)
+
+```bash
+python main.py
+```
 
 ## 🔐 Bezpieczeństwo i Komunikacja
 
