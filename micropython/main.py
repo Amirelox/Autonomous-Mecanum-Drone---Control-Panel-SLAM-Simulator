@@ -421,6 +421,91 @@ class RobotController:
         self.estop = False
         print("[CONTROLLER] Resume - send neutral command to arm")
     
+    def calibrate_start_position(self):
+        """
+        Kalibruje pozycję startową robota używając czujników ToF.
+        
+        Robot znajduje się w kafelku startowym i mierzy odległości do ścian
+        aby precyzyjnie określić swoją pozycję (x, y) względem środka kafelka.
+        
+        Logika:
+        1. Mierzy odległość do lewej i prawej ściany -> oblicza pozycję X
+        2. Mierzy odległość do tylnej i przedniej ściany -> oblicza pozycję Y
+        3. Ustawia heading na 0 (północ) jako domyślny
+        
+        Returns:
+            bool: True jeśli kalibracja udana
+        """
+        print("[CALIBRATION] Starting position calibration...")
+        
+        try:
+            # Odczytaj dane z czujników
+            lidar_data = self.sensors.read_lidar()
+            
+            # Czujniki są rozmieszczone co 60°: [0°, 60°, 120°, 180°, 240°, 300°]
+            # Sensor 0° = przód, 90° = prawo, 180° = tył, 270° = lewo
+            
+            # Przybliżone indeksy sensorów dla kierunków (może wymagać kalibracji)
+            # Zakładamy że sensory są zamontowane symetrycznie
+            front_sensor_idx = 0      # 0° - przód
+            right_sensor_idx = 2      # ~120° - prawo (blisko 90°)
+            back_sensor_idx = 3       # 180° - tył
+            left_sensor_idx = 5       # ~300° (-60°) - lewo (blisko 270°)
+            
+            # Pobierz odległości (w mm lub jednostkach symulacji)
+            d_front = lidar_data[front_sensor_idx]["d"] if front_sensor_idx < len(lidar_data) else SENSOR_RANGE
+            d_right = lidar_data[right_sensor_idx]["d"] if right_sensor_idx < len(lidar_data) else SENSOR_RANGE
+            d_back = lidar_data[back_sensor_idx]["d"] if back_sensor_idx < len(lidar_data) else SENSOR_RANGE
+            d_left = lidar_data[left_sensor_idx]["d"] if left_sensor_idx < len(lidar_data) else SENSOR_RANGE
+            
+            print(f"[CALIBRATION] Distances - Front: {d_front:.1f}, Right: {d_right:.1f}, Back: {d_back:.1f}, Left: {d_left:.1f}")
+            
+            # Sprawdź czy wszystkie pomiary są sensowne (nie za duże = brak ściany)
+            max_valid_distance = CELL_SIZE * 1.5  # Maksymalna odległość do ściany w kafelku
+            
+            if any(d > max_valid_distance for d in [d_front, d_right, d_back, d_left]):
+                print("[CALIBRATION] WARNING: Some sensors don't detect walls. Using default position.")
+                # Użyj domyślnej pozycji środkowej
+                self.pos_x = WALL_THICK + PATH_WIDTH / 2
+                self.pos_y = WALL_THICK + PATH_WIDTH / 2
+                self.heading = 0.0
+                return False
+            
+            # Oblicz pozycję X (od lewej ściany)
+            # Szerokość kafelka = PATH_WIDTH
+            # Pozycja X = d_left + ROBOT_W_WIDTH/2
+            calculated_x = d_left + ROBOT_W_WIDTH / 2
+            
+            # Oblicz pozycję Y (od tylnej ściany)
+            # Długość kafelka = PATH_WIDTH
+            # Pozycja Y = d_back + ROBOT_L_LENGTH/2
+            calculated_y = d_back + ROBOT_L_LENGTH / 2
+            
+            # Walidacja: czy pozycja jest wewnątrz kafelka
+            if 0 <= calculated_x <= PATH_WIDTH and 0 <= calculated_y <= PATH_WIDTH:
+                self.pos_x = calculated_x
+                self.pos_y = calculated_y
+                self.heading = 0.0  # Domyślnie północ
+                
+                print(f"[CALIBRATION] ✓ Position calibrated: X={self.pos_x:.2f}, Y={self.pos_y:.2f}, Heading=0°")
+                print(f"[CALIBRATION] Offset from center: dx={calculated_x - PATH_WIDTH/2:.2f}, dy={calculated_y - PATH_WIDTH/2:.2f}")
+                
+                return True
+            else:
+                print(f"[CALIBRATION] ✗ Calculated position out of bounds! Using default.")
+                self.pos_x = WALL_THICK + PATH_WIDTH / 2
+                self.pos_y = WALL_THICK + PATH_WIDTH / 2
+                self.heading = 0.0
+                return False
+                
+        except Exception as e:
+            print(f"[CALIBRATION] Error during calibration: {e}")
+            # Fallback do domyślnej pozycji
+            self.pos_x = WALL_THICK + PATH_WIDTH / 2
+            self.pos_y = WALL_THICK + PATH_WIDTH / 2
+            self.heading = 0.0
+            return False
+    
     def update_sensors(self):
         """Aktualizuje dane z czujników przez ESP32 i aktualizuje mapę logiczną."""
         if not self.sensors.initialized:

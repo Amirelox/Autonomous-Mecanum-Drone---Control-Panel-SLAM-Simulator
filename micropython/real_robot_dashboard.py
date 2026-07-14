@@ -240,6 +240,15 @@ async def connect_to_esp32():
         # Utwórz kontroler
         controller = RobotController(ws_client)
         
+        # Kalibruj pozycję startową używając czujników ToF
+        ui.notify('Kalibracja pozycji startowej...', type='info')
+        calibration_success = controller.calibrate_start_position()
+        
+        if calibration_success:
+            ui.notify('Pozycja skalibrowana pomyślnie!', type='positive')
+        else:
+            ui.notify('Użyto domyślnej pozycji startowej', type='warning')
+        
         # Uzbrój robota
         ui.notify('Uzbrajanie robota...', type='info')
         for _ in range(10):
