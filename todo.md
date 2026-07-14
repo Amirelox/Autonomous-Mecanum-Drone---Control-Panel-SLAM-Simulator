@@ -32,7 +32,7 @@ W momencie powrotu na start i zatrzymania robota, uruchamia się jednorazowy skr
 
 ---
 
-## 🏎️ Czwartek: Realistyczny Model Fizyczny EV i Ścinanie Zakrętów
+## 🏎️ Realistyczny Model Fizyczny EV i Ścinanie Zakrętów
 
 **Cel:** Zastąpienie idealnego punktu matematycznego zaawansowanym modelem dynamiki pojazdu. Obliczenia pędu, masy oraz przyczepności opon zostają zaimplementowane bezpośrednio w silniku fizycznym serwera.
 
@@ -55,7 +55,7 @@ W momencie powrotu na start i zatrzymania robota, uruchamia się jednorazowy skr
 
 ---
 
-## 📡 Piątek: Zaszumiona Odometria i Pętla Korekcji SLAM (ICP)
+## 📡 Zaszumiona Odometria i Pętla Korekcji SLAM (ICP)
 
 **Cel:** Przeniesienie symulacji w realia fizycznych zakłóceń sensorów. Wprowadzenie dryfu pozycji zmusza robota do ciągłego weryfikowania i prostowania trasy na podstawie wskazań laserów.
 
@@ -77,3 +77,16 @@ Po wdrożeniu powyższego planu, dashboard Streamlit będzie obrazował zaawanso
 1. **Wizualizacja Real World:** Pokaże płynną jazdę z uwzględnieniem masy, uślizgów kół i bezwładnego wchodzenia w zakręty.
 2. **Wizualizacja SLAM Grid Map:** Udowodni skuteczność algorytmów filtracji, pokazując, jak wirtualna pozycja robota co chwilę koryguje się (skacze) do stanu rzeczywistego dzięki odbiciom laserów od ścian.
 3. **Statystyki:** Wykażą bezbłędność wyznaczania trasy przez czysty algorytm BFS w warunkach braku jakiejkolwiek wiedzy startowej o wielkości i układzie labiryntu.
+
+
+## JIRA
+VL53L0X 
+## Napisz kod:
+# Przepisanie programy do micropython - oraz korzystanie z gotowego API do czujników ToF wykorzystanie TCA9548A
+
+# # Przygotowanie responsywnego dashboardu do badania obserwacji robota z czujników dodanie najważniejszych funkcjonalnosci np. kill switch, wybor dwoch trybow
+
+Napisz dokument:
+# Przygotowanie algorytmów dla realistycznego jak najszybszego przejscia znanego labiryntu (próba 2 i 3)
+
+# rozwiazanie problemu automatycznego oznaczenia startu i mety PO PIERWSZEJ PROBIE. Rozwiązanie problemu przełączania pomiędzy trybami drona (eksploracja/speedrun)
