@@ -1,152 +1,146 @@
-# Klient Raspberry Pi dla ESP32-S3 Mecanum Robot
+# ESP32 Brain Client dla Mecanum Robot (Architektura V1 - bez RPi)
 
 ## 📋 Opis
 
-Implementacja klienta w Python 3 dla Raspberry Pi, który komunikuje się z robotem na bazie ESP32-S3 przez WebSocket. Raspberry Pi działa jako **główny kontroler** (dashboard, SLAM, eksploracja), a ESP32 obsługuje niskopoziomowe sterowanie silnikami i odczyt czujników.
+Implementacja klienta w **MicroPython** dla drugiego ESP32-S3 który działa jako **"mózg"** robota. Komunikuje się z pierwszym ESP32 (Hardware Controller) przez **UART**.
+
+**Architektura V1 (bez Raspberry Pi):**
+- **ESP32 #1 (Hardware Controller)**: steruje silnikami, czyta czujniki, serwuje API UART
+- **ESP32 #2 (Brain)**: ten plik - algorytmy DFS, SLAM, nawigacja w MicroPythonie
 
 ## 🎯 Funkcjonalności
 
 ### ✅ Zaimplementowane
-- **Klient WebSocket** - połączenie z ESP32 (tryb AP lub WiFi)
-- **Autentykacja challenge-response** (HMAC-SHA256)
-- **Wysyłanie komend** (20-50 Hz) do ESP32
-- **Odbieranie telemetry** od ESP32 (pozycja, status, czujniki)
+- **Klient UART** - połączenie z ESP32 Hardware (GPIO16/17, 115200 baud)
+- **Wysyłanie komend** (20-50 Hz) do ESP32 Hardware
+- **Odbieranie telemetry** od ESP32 Hardware (pozycja, status, czujniki)
 - **Bezpieczeństwo** (E-stop, arming/disarming)
-- **Logika eksploracji DFS** i nawigacji
-- **SLAM** (mapa probabilistyczna)
-- **Dashboard HTTP** (NiceGUI) - wizualizacja w przeglądarce
+- **Logika eksploracji DFS** i nawigacji BFS
+- **SLAM** (mapa logiczna ścian 41x41)
+- **Kalibracja pozycji startowej** używając czujników ToF
 
 ### 🔧 Do uzupełnienia po otrzymaniu API czujników
-1. **ESP32WebSocketClient** - pełna implementacja odbierania danych z czujników
-2. **SensorAPI** - integracja z danymi z ESP32 zamiast placeholderów
+1. **UARTHardwareClient** - pełna implementacja odbierania danych z czujników
+2. **SensorAPI** - integracja z danymi z ESP32 Hardware zamiast placeholderów
 3. **Fuzja sensorów** - kalman filter/complementary filter dla pozycji
 
 ## 🏗️ Architektura systemu
 
 ```
-┌─────────────────────┐         WebSocket          ┌──────────────────┐
-│   ESP32-S3-Zero     │ ◄────────────────────────► │  Raspberry Pi    │
-│   (Access Point)    │      ws://192.168.4.1/ws   │   (Main Brain)   │
-│                     │       (port 8765)          │                  │
-│ • Serwer WS         │                            │ • Dashboard HTTP │
-│ • Sterowanie        │                            │   (NiceGUI)      │
-│   silnikami         │                            │ • Logika DFS/SLAM│
-│ • Odczyt czujników  │                            │ • Autentykacja   │
-│ • Watchdog          │                            │ • Mapa           │
-└─────────────────────┘                            └──────────────────┘
-       ↑                                                    ↑
-       │                                                    │
-   UART/I2C/SPI                                     http://localhost:8080
-   (czujniki)                                         (przeglądarka)
+┌─────────────────────┐         UART          ┌──────────────────┐
+│   ESP32-S3 #2       │ ◄───────────────────► │  ESP32-S3 #1     │
+│   (Brain/Mózg)      │    GPIO16/17, 115200  │  (Hardware Ctrl) │
+│                     │                       │                  │
+│ • Algorytmy DFS/BFS │                       │ • Sterowanie     │
+│ • SLAM              │                       │   silnikami      │
+│ • Nawigacja         │                       │ • Odczyt czujn.  │
+│ • Kalibracja        │                       │ • Watchdog       │
+└─────────────────────┘                       └──────────────────┘
+                                                       ↑
+                                                       │
+                                                  UART/I2C/SPI
+                                                  (czujniki)
 ```
 
-**Raspberry Pi (Główny kontroler):**
-- Uruchamia dashboard HTTP (NiceGUI) na porcie 8080
-- Łączy się z ESP32 przez WebSocket
-- Wysyła komendy ruchu (vx, vy, w) do ESP32
-- Odbiera dane telemetryczne (pozycja, status, czujniki)
-- Implementuje logikę eksploracji DFS i SLAM
+**ESP32 #2 (Brain/Mózg):**
+- Uruchamia algorytm eksploracji DFS
+- Oblicza ścieżki BFS do celów
+- Wysyła komendy ruchu (vx, vy, w) przez UART
+- Odbiera dane telemetryczne od ESP32 #1
+- Implementuje logikę SLAM i mapę logiczną
 
-**Raspberry Pi:**
-- Uruchamia dashboard HTTP (NiceGUI) na porcie 8080
-- Łączy się z ESP32 przez WebSocket
-- Wysyła komendy ruchu (vx, vy, w) do ESP32
-- Odbiera dane telemetryczne (pozycja, status, czujniki)
-- Implementuje logikę eksploracji DFS i SLAM
+**ESP32 #1 (Hardware Controller):**
+- Steruje silnikami mecanum przez PWM
+- Odczytuje czujniki (VL53L7CX, ICM-20948, enkodery)
+- Serwuje API UART dla ESP32 #2
+- Implementuje watchdog i bezpieczeństwo
 
 ## 🚀 Instalacja
 
 ### Hardware
-- Raspberry Pi (4B/5 lub Zero 2 W)
-- ESP32-S3-Zero (lub inny ESP32-S3) - podłączony do robota
-- Czujniki na robocie (podłączone do ESP32):
+- **ESP32-S3 #1 (Hardware Controller)**: podłączony do silników, czujników
+- **ESP32-S3 #2 (Brain/Mózg)**: ten plik - algorytmy nawigacji
+- Połączenie UART między ESP32: GPIO16 (RX) ↔ GPIO17 (TX), wspólna masa
+- Czujniki na robocie (podłączone do ESP32 #1):
   - 6x VL53L7CX (ToF) z multiplekserem TCA9548A
   - ICM-20948 (IMU 9-DOF)
   - Enkodery przy silnikach JGA25-370
 
-### Software (Raspberry Pi)
-- Python 3.9+
-- Biblioteki: `websockets`, `nicegui`, `numpy`
-- System: Raspberry Pi OS (Debian-based)
+### Software
+- **MicroPython v1.20+** dla ESP32-S3
+- Biblioteki wbudowane: `uasyncio`, `ujson`, `machine`
 
 ## 🛠️ Konfiguracja
 
-### 1. Zainstaluj zależności na Raspberry Pi
+### 1. Flash MicroPython na obu ESP32
 
 ```bash
-pip install websockets nicegui numpy
+# Pobierz firmware MicroPython dla ESP32-S3
+# https://micropython.org/download/esp32s3/
+
+# Wyczyść flash
+esptool.py --port COM3 erase_flash
+
+# Wgraj firmware
+esptool.py --port COM3 write_flash -z 0x1000 esp32s3-*.bin
 ```
 
-### 2. Skonfiguruj połączenie z ESP32
+### 2. Podłącz UART między ESP32
 
-Edytuj plik `main.py` i ustaw:
-```python
-ws_client = ESP32WebSocketClient(
-    host="192.168.4.1",  # IP ESP32 w trybie AP
-    port=8765,
-    secret_key="robot_secret_2024"  # Ten sam klucz co na ESP32!
-)
+```
+ESP32 #2 (Brain)          ESP32 #1 (Hardware)
+GPIO17 (TX)  ──────────►  GPIO16 (RX)
+GPIO16 (RX)  ◄──────────  GPIO17 (TX)
+GND          ──────────►  GND
 ```
 
-### 3. Uruchom dashboard rzeczywistego robota
+### 3. Wgraj pliki na ESP32 #2 (Brain)
 
 ```bash
-cd micropython
-python real_robot_dashboard.py
+# Użyj Thonny IDE lub ampy
+ampy --port COM4 put micropython/esp32_brain_main.py /main.py
 ```
 
-Dashboard uruchomi się na porcie **8081** i automatycznie:
-- Połączy się z ESP32
-- Uzbroi robota
-- Rozpocznie automatyczną eksplorację DFS
-- Po zakończeniu wykona fast run BFS do narożnika
+### 4. Uruchom program
 
-Otwórz w przeglądarce: http://localhost:8081
-
-### Alternatywnie: Uruchom tylko klienta (bez UI)
-
-```bash
-python main.py
-```
+Po wgraniu pliku, ESP32 automatycznie uruchomi `main.py`.
+Możesz monitorować przez serial monitor (115200 baud).
 
 ## 🔐 Bezpieczeństwo i Komunikacja
 
-### Autentykacja WebSocket
-Zgodnie z `api.md`, połączenie wymaga handshake'u:
-1. ESP32 wysyła `{"nonce": "..."}`
-2. Klient (RPi) oblicza HMAC-SHA256 i odsyła podpis
-3. Po pomyślnej weryfikacji rozpoczyna się strumieniowanie danych
+### Protokół UART
+Komunikacja między ESP32 odbywa się przez JSON linia po linii:
+```json
+{"cmd": "set_motors", "fl": 0.5, "fr": 0.5, "rl": 0.5, "rr": 0.5}\n
+{"cmd": "get_sensors"}\n
+```
 
 ### Watchdog
 - Robot zatrzymuje się po **350ms** bez nowej komendy
-- Raspberry Pi musi wysyłać pakiety z częstotliwością **20-50 Hz**
+- ESP32 Brain musi wysyłać pakiety z częstotliwością **20-50 Hz**
 - Po utracie połączenia robot przechodzi w stan rozbrojony (disarmed)
 
 ## 📊 Telemetria
 
-ESP32 wysyła ramkę stanu do Raspberry Pi (~5 Hz):
+ESP32 Hardware wysyła dane do ESP32 Brain (~10 Hz):
 ```json
 {
-  "armed": 1,
-  "estop": 0,
-  "src": 1,
-  "speed": 0.50,
-  "age_ms": 18,
-  "heap": 150000
+  "lidar": [{"d": 1500.0, "hit": true}, ...],
+  "imu": {"ax": 0.0, "ay": 0.0, "az": 9.81, ...},
+  "encoders": {"fl": 1234, "fr": 1230, "rl": 1235, "rr": 1232}
 }
 ```
 
 ## 🔄 Roadmapa
 
 ### Po otrzymaniu API czujników:
-1. [ ] Zaimplementuj odbieranie danych z VL53L7CX przez WebSocket
+1. [ ] Zaimplementuj odbieranie danych z VL53L7CX przez UART
 2. [ ] Dodaj obsługę danych IMU ICM-20948
 3. [ ] Zaimplementuj odczyt enkoderów kwadraturowych
 4. [ ] Dodaj fuzję sensorów (kalman filter) dla pozycji
 
 ## ⚠️ Uwagi
-- Ten kod jest przeznaczony do uruchomienia **na Raspberry Pi**.
-- ESP32 musi być wcześniej skonfigurowany i wgrany z odpowiednim firmware.
-- Upewnij się, że klucze HMAC są takie same na obu urządzeniach.
-- Logika SLAM i dashboard znajdują się na **Raspberry Pi**.
-- Upewnij się, że klucz HMAC w `secrets.py` jest identyczny z tym użytym w konfiguracji Raspberry Pi.
+- Ten kod jest przeznaczony do wgrania na **ESP32-S3 #2 (Brain)**.
+- ESP32 #1 (Hardware Controller) musi być wcześniej skonfigurowany.
+- Upewnij się że połączenie UART jest poprawne (GPIO16/17).
+- Logika SLAM i algorytmy działają na **ESP32 #2**.
