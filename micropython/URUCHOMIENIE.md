@@ -1,52 +1,233 @@
-# 🚀 Przewodnik Uruchomienia - Rzeczywisty Robot
+# 🚀 Przewodnik Uruchomienia - Architektura V1.1 (Dwa ESP32)
 
 ## 📋 Architektura Systemu
 
 ```
-┌─────────────────────┐         WebSocket          ┌──────────────────┐
-│   ESP32-S3-Zero     │ ◄────────────────────────► │  Raspberry Pi    │
-│   (na robocie)      │      ws://ESP32_IP/ws      │                  │
-│                     │       (port 8765)          │                  │
-│ • Sterowanie        │                            │ • Dashboard HTTP │
-│   silnikami         │                            │   (NiceGUI)      │
-│ • Odczyt czujników  │                            │ • Logika DFS/SLAM│
-│ • Watchdog          │                            │ • Autentykacja   │
-│ • Komendy ruchu     │                            │ • Mapa           │
-└─────────────────────┘                            └──────────────────┘
-       ↑                                                    ↑
-       │                                                    │
-   UART/I2C/SPI                                     http://localhost:8080
-   (czujniki)                                         (przeglądarka)
+┌─────────────────────┐         UART          ┌──────────────────┐
+│   ESP32-S3 #2       │ ◄───────────────────► │  ESP32-S3 #1     │
+│   (Brain/Mózg)      │    GPIO16/17, 115200  │  (Hardware Ctrl) │
+│                     │                       │                  │
+│ • Algorytmy DFS/BFS │                       │ • Sterowanie     │
+│ • SLAM              │                       │   silnikami      │
+│ • Serwer HTTP       │                       │ • Odczyt czujn.  │
+│   (port 8080)       │                       │ • Watchdog       │
+└─────────┬───────────┘                       └──────────────────┘
+          │                                            ↑
+          │ WiFi AP                                    │
+          ▼                                    UART/I2C/SPI
+   📱 Telefon/Tablet                              (czujniki)
+   http://192.168.4.1:8080
 ```
 
 ---
 
 ## 🔧 KROK 1: Przygotowanie ESP32-S3
 
-### 1.1 Flash MicroPython na ESP32
-
-ESP32 musi mieć wgrany firmware z serwerem WebSocket i obsługą czujników.
+### 1.1 Flash MicroPython na obu ESP32
 
 ```bash
 # Pobierz firmware MicroPython dla ESP32-S3
 # https://micropython.org/download/esp32s3/
 
-# Wyczyść flash
+# Wyczyść flash ESP32 #1 (Hardware)
 esptool.py --port COM3 erase_flash
-
-# Wgraj firmware
 esptool.py --port COM3 write_flash -z 0x1000 esp32s3-*.bin
+
+# Wyczyść flash ESP32 #2 (Brain)
+esptool.py --port COM4 erase_flash
+esptool.py --port COM4 write_flash -z 0x1000 esp32s3-*.bin
 ```
 
-### 1.2 Skonfiguruj ESP32
+### 1.2 Podłącz UART między ESP32
 
-Na ESP32 musi być uruchomiony:
-- Serwer WebSocket na porcie 8765
-- Tryb Access Point (AP) lub połączenie do WiFi
-- Obsługa autentykacji HMAC-SHA256
-- Sterowanie silnikami i odczyt czujników
+```
+ESP32 #2 (Brain)          ESP32 #1 (Hardware)
+GPIO17 (TX)  ──────────►  GPIO16 (RX)
+GPIO16 (RX)  ◄──────────  GPIO17 (TX)
+GND          ──────────►  GND
+```
 
-**Uwaga:** Kod dla ESP32 jest w osobnym repozytorium/pliku. Ten folder zawiera kod dla **Raspberry Pi**.
+**Uwaga:** Upewnij się że oba ESP32 mają wspólną masę (GND)!
+
+### 1.3 Wgraj kod na ESP32 #2 (Brain)
+
+```bash
+# Użyj Thonny IDE lub ampy
+ampy --port COM4 put micropython/esp32_brain_main.py /main.py
+```
+
+Po wgraniu pliku, ESP32 automatycznie uruchomi program przy resecie.
+
+---
+
+## 💻 KROK 2: Uruchomienie Systemu
+
+### 2.1 Włącz oba ESP32
+
+1. Podłącz zasilanie do ESP32 #1 (Hardware Controller)
+2. Podłącz zasilanie do ESP32 #2 (Brain)
+3. ESP32 #2 automatycznie:
+   - Tworzy sieć WiFi "Mecanum_Drone_AP"
+   - Uruchamia serwer HTTP na porcie 8080
+   - Czeka na komendę START z telefonu
+
+### 2.2 Połącz telefon z ESP32
+
+1. Na telefonie/tablecie otwórz ustawienia WiFi
+2. Znajdź sieć: **Mecanum_Drone_AP**
+3. Hasło: `robot_password_2026`
+4. Połącz się z siecią
+
+### 2.3 Otwórz dashboard
+
+1. Otwórz przeglądarkę na telefonie
+2. Wpisz adres: **http://192.168.4.1:8080**
+3. Zobaczysz dashboard z przyciskami:
+   - 🚀 START EXPLORATION
+   - 🛑 EMERGENCY KILL
+   - 🔄 RESUME UNLOCK
+
+### 2.4 Rozpocznij eksplorację
+
+1. Kliknij **🚀 START EXPLORATION**
+2. ESP32 wykonuje autokalibrację ToF (centrowanie w kafelku)
+3. Uzbraja robota (10 komend neutralnych)
+4. Rozpoczyna eksplorację DFS
+
+---
+
+## 🎮 KROK 3: Monitorowanie Eksploracji
+
+### Dashboard pokazuje:
+- **Tryb**: EXPLORE → SPEEDRUN → EMERGENCY STOP
+- **Siatka DFS**: aktualna komórka [r, c]
+- Status w czasie rzeczywistym (aktualizacja co 400ms)
+
+### Sekwencja działania:
+1. ✅ **Eksploracja DFS** - robot odwiedza wszystkie dostępne komórki
+2. ✅ **Powrót do startu** - po opróżnieniu stosu wraca do (1,1)
+3. ✅ **Obliczenie BFS** - znajduje najkrótszą ścieżkę do narożnika
+4. ✅ **Fast Run** - nawiguje po optymalnej ścieżce z większą prędkością
+5. ✅ **Meta** - dociera do celu i zatrzymuje się
+
+---
+
+## 🔍 Rozwiązywanie Problemów
+
+### Problem: Nie widzę sieci WiFi "Mecanum_Drone_AP"
+
+**Rozwiązanie:**
+1. Sprawdź czy ESP32 #2 jest włączony (dioda LED powinna migać)
+2. Podłącz przez USB i sprawdź serial monitor (115200 baud)
+3. Powinieneś zobaczyć: `[WIFI] Sieć aktywna...`
+
+### Problem: Dashboard nie ładuje się
+
+**Rozwiązanie:**
+1. Upewnij się że jesteś połączony z WiFi "Mecanum_Drone_AP"
+2. Spróbuj adresu: http://192.168.4.1:8080
+3. Sprawdź czy firewall nie blokuje portu 8080
+
+### Problem: Robot nie rusza po kliknięciu START
+
+**Rozwiązanie:**
+1. Sprawdź połączenie UART między ESP32 (GPIO16/17)
+2. Upewnij się że ESP32 #1 (Hardware) jest włączony
+3. Sprawdź serial monitor ESP32 #2 czy nie ma błędów UART
+
+### Problem: Robot uderza w ściany
+
+**Rozwiązanie:**
+1. Sprawdź czy czujniki ToF są poprawnie podłączone do ESP32 #1
+2. Kalibracja może być niedokładna - upewnij się że robot jest w kafelku startowym
+3. Sprawdź logi: `[CALIBRATION] ✓ Pozycja zsynchronizowana...`
+
+---
+
+## 📊 Diagnostyka
+
+### Serial Monitor ESP32 #2 (Brain)
+
+Podłącz przez USB i otwórz serial monitor (115200 baud):
+
+```python
+# Powinieneś zobaczyć:
+[WIFI] Sieć aktywna. Połącz telefon z 'Mecanum_Drone_AP'...
+[UART] Połączono z Hardware Controller (ESP32 #1)
+[CALIBRATION] ✓ Pozycja zsynchronizowana: X=150.0mm, Y=150.0mm
+[EXPLORATION] DFS completed!
+[GOAL] Target cell: (15, 20)
+[FAST RUN] Path length: 12 cells
+[FINISHED] Wyścig zakończony. Zamykanie systemów.
+```
+
+### Sprawdzenie połączenia UART
+
+Na ESP32 #1 (Hardware) sprawdź czy odbiera komendy:
+```python
+# W REPL ESP32 #1
+import machine
+uart = machine.UART(2, baudrate=115200, tx=17, rx=16)
+print(uart.readline())  # Powinno pokazywać JSON z komendami
+```
+
+---
+
+## ⚠️ Bezpieczeństwo
+
+1. **Zawsze testuj na pustej przestrzeni** - robot może się poruszać nieprzewidywalnie
+2. **Miej pod ręką przycisk E-STOP** - w dashboardzie lub fizyczny przycisk
+3. **Sprawdź watchdog** - robot powinien zatrzymać się po utracie połączenia UART
+4. **Testuj najpierw z niską prędkością** - zacznij od 10-20% mocy
+5. **Upewnij się że bateria jest naładowana** - niskie napięcie = nieprzewidywalne zachowanie
+
+---
+
+## 🔄 Aktualizacja Kodu
+
+### Na ESP32 #2 (Brain)
+
+```bash
+# Wgraj nowy kod
+ampy --port COM4 put micropython/esp32_brain_main.py /main.py
+
+# Restart ESP32
+# Naciśnij przycisk RESET na ESP32
+```
+
+### Na ESP32 #1 (Hardware)
+
+```bash
+# Wgraj nowy kod hardware controller
+ampy --port COM3 put hardware_controller.py /main.py
+
+# Restart ESP32
+import machine
+machine.reset()
+```
+
+---
+
+## 📝 Checklist Przed Startem
+
+- [ ] Oba ESP32 wgrane z MicroPython v1.20+
+- [ ] Połączenie UART: GPIO16 ↔ GPIO17 + wspólna masa
+- [ ] ESP32 #1 podłączony do silników i czujników
+- [ ] Czujniki VL53L7CX sprawne (test przez I2C)
+- [ ] IMU ICM-20948 sprawne
+- [ ] Enkodery podłączone
+- [ ] Bateria naładowana (min. 7.4V)
+- [ ] Robot ustawiony w kafelku startowym (1,1)
+- [ ] Telefon połączony z WiFi "Mecanum_Drone_AP"
+- [ ] Dashboard dostępny na http://192.168.4.1:8080
+
+---
+
+## 🆘 Kontakt i Wsparcie
+
+- Kod ESP32 Brain: `micropython/esp32_brain_main.py`
+- Dokumentacja API Hardware: `api.md`
+- Lista części: `.txt`
 
 ---
 

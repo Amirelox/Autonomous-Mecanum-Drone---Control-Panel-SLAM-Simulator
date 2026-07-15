@@ -1,23 +1,25 @@
-# ESP32 Brain Client dla Mecanum Robot (Architektura V1 - bez RPi)
+# ESP32 Brain Client dla Mecanum Robot - V1.1 Production
 
 ## 📋 Opis
 
-Implementacja klienta w **MicroPython** dla drugiego ESP32-S3 który działa jako **"mózg"** robota. Komunikuje się z pierwszym ESP32 (Hardware Controller) przez **UART**.
+**Natywny system operacyjny** dla ESP32-S3 #2 (Mózg) z **wbudowanym dashboardem HTTP** dostępnym przez telefon.
 
-**Architektura V1 (bez Raspberry Pi):**
-- **ESP32 #1 (Hardware Controller)**: steruje silnikami, czyta czujniki, serwuje API UART
-- **ESP32 #2 (Brain)**: ten plik - algorytmy DFS, SLAM, nawigacja w MicroPythonie
+**Architektura V1.1:**
+- **ESP32 #1 (Hardware Controller)**: steruje silnikami, czyta czujniki, API UART
+- **ESP32 #2 (Brain/Mózg)**: ten plik - algorytmy DFS/BFS/SLAM + serwer HTTP dla telefonu
 
 ## 🎯 Funkcjonalności
 
 ### ✅ Zaimplementowane
+- **Wbudowany serwer HTTP** - dashboard dostępny na `http://192.168.4.1:8080`
+- **Access Point WiFi** - ESP32 tworzy sieć "Mecanum_Drone_AP"
 - **Klient UART** - połączenie z ESP32 Hardware (GPIO16/17, 115200 baud)
-- **Wysyłanie komend** (20-50 Hz) do ESP32 Hardware
-- **Odbieranie telemetry** od ESP32 Hardware (pozycja, status, czujniki)
-- **Bezpieczeństwo** (E-stop, arming/disarming)
-- **Logika eksploracji DFS** i nawigacji BFS
-- **SLAM** (mapa logiczna ścian 41x41)
-- **Kalibracja pozycji startowej** używając czujników ToF
+- **Autokalibracja ToF** - precyzyjne centrowanie w kafelku startowym
+- **Eksploracja DFS** - pełne mapowanie labiryntu z wykrywaniem ścian
+- **Fast Run BFS** - optymalna ścieżka do narożnika po zakończeniu eksploracji
+- **SLAM** - mapa logiczna 41x41 z aktualizacją w czasie rzeczywistym
+- **Kinematyka Mecanum** - mikser prędkości 4 kół
+- **Watchdog i bezpieczeństwo** - E-stop, arming/disarming
 
 ### 🔧 Do uzupełnienia po otrzymaniu API czujników
 1. **UARTHardwareClient** - pełna implementacja odbierania danych z czujników
@@ -34,20 +36,25 @@ Implementacja klienta w **MicroPython** dla drugiego ESP32-S3 który działa jak
 │ • Algorytmy DFS/BFS │                       │ • Sterowanie     │
 │ • SLAM              │                       │   silnikami      │
 │ • Nawigacja         │                       │ • Odczyt czujn.  │
-│ • Kalibracja        │                       │ • Watchdog       │
-└─────────────────────┘                       └──────────────────┘
-                                                       ↑
-                                                       │
-                                                  UART/I2C/SPI
-                                                  (czujniki)
+│ • Serwer HTTP       │                       │ • Watchdog       │
+│   (port 8080)       │                       │                  │
+└─────────┬───────────┘                       └──────────────────┘
+          │                                            ↑
+          │ WiFi AP                                    │
+          ▼                                    UART/I2C/SPI
+   📱 Telefon/Tablet                              (czujniki)
+   http://192.168.4.1:8080
 ```
 
 **ESP32 #2 (Brain/Mózg):**
+- Tworzy sieć WiFi AP "Mecanum_Drone_AP"
+- Hostuje dashboard HTTP na porcie 8080
 - Uruchamia algorytm eksploracji DFS
 - Oblicza ścieżki BFS do celów
-- Wysyła komendy ruchu (vx, vy, w) przez UART
-- Odbiera dane telemetryczne od ESP32 #1
+- Wysyła komendy ruchu przez UART do ESP32 #1
+- Odbiera dane z czujników przez UART
 - Implementuje logikę SLAM i mapę logiczną
+- Autokalibruje pozycję startową używając ToF
 
 **ESP32 #1 (Hardware Controller):**
 - Steruje silnikami mecanum przez PWM
@@ -59,7 +66,7 @@ Implementacja klienta w **MicroPython** dla drugiego ESP32-S3 który działa jak
 
 ### Hardware
 - **ESP32-S3 #1 (Hardware Controller)**: podłączony do silników, czujników
-- **ESP32-S3 #2 (Brain/Mózg)**: ten plik - algorytmy nawigacji
+- **ESP32-S3 #2 (Brain/Mózg)**: ten plik - algorytmy nawigacji + serwer HTTP
 - Połączenie UART między ESP32: GPIO16 (RX) ↔ GPIO17 (TX), wspólna masa
 - Czujniki na robocie (podłączone do ESP32 #1):
   - 6x VL53L7CX (ToF) z multiplekserem TCA9548A
@@ -68,7 +75,7 @@ Implementacja klienta w **MicroPython** dla drugiego ESP32-S3 który działa jak
 
 ### Software
 - **MicroPython v1.20+** dla ESP32-S3
-- Biblioteki wbudowane: `uasyncio`, `ujson`, `machine`
+- Biblioteki wbudowane: `uasyncio`, `ujson`, `machine`, `network`, `usocket`
 
 ## 🛠️ Konfiguracja
 
@@ -94,7 +101,7 @@ GPIO16 (RX)  ◄──────────  GPIO17 (TX)
 GND          ──────────►  GND
 ```
 
-### 3. Wgraj pliki na ESP32 #2 (Brain)
+### 3. Wgraj plik na ESP32 #2 (Brain)
 
 ```bash
 # Użyj Thonny IDE lub ampy
@@ -103,8 +110,17 @@ ampy --port COM4 put micropython/esp32_brain_main.py /main.py
 
 ### 4. Uruchom program
 
-Po wgraniu pliku, ESP32 automatycznie uruchomi `main.py`.
-Możesz monitorować przez serial monitor (115200 baud).
+Po wgraniu pliku, ESP32 automatycznie uruchomi `main.py`:
+1. Tworzy sieć WiFi "Mecanum_Drone_AP" (hasło: robot_password_2026)
+2. Uruchamia serwer HTTP na porcie 8080
+3. Czeka na kliknięcie "START EXPLORATION" w dashboardzie
+
+### 5. Połącz się telefonem
+
+1. Na telefonie/tablecie połącz się z WiFi: **Mecanum_Drone_AP**
+2. Hasło: `robot_password_2026`
+3. Otwórz przeglądarkę: **http://192.168.4.1:8080**
+4. Kliknij **🚀 START EXPLORATION**
 
 ## 🔐 Bezpieczeństwo i Komunikacja
 
