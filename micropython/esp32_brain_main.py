@@ -1,8 +1,9 @@
 """
-ESP32-S3 "Brain" Client for Mecanum Robot - V1.1 Production
+ESP32-S3 "Brain" Client for Mecanum Robot - V1.2 Production
 ==========================================================
 Natywny system operacyjny dla ESP32 #2 (Mózg). 
-Obsługuje wyzwanie HMAC-SHA256, mikser bazy, ślepy DFS/BFS oraz serwer HMI dla telefonu.
+W pełni zintegrowany z dedykowanym API sensorów ToF, mikserem bazy,
+ślepy DFS/BFS oraz wbudowanym serwerem Web HMI dla telefonu.
 """
 
 import uasyncio as asyncio
@@ -14,7 +15,7 @@ import network
 import usocket as socket
 
 # ============================================================
-# 📐 REALISTYCZNE PARAMETRY FIZYCZNE (Korekta Skali Turniejowej)
+# 📐 PARAMETRY FIZYCZNE (Skala Turniejowa - mm)
 # ============================================================
 CELL_SIZE = 300.0       # Rozmiar komórki labiryntu: 300 mm (30 cm)
 WALL_THICK = 12.0       # Grubość ściany: 12 mm
@@ -37,7 +38,7 @@ UART_TX_PIN = 17
 UART_RX_PIN = 16  
 
 # ============================================================
-# KOMUNIKATOR UART DO ESP32 HARDWARE
+# 🔌 TRANSMISJA UART DO ESP32 HARDWARE
 # ============================================================
 class UARTHardwareClient:
     def __init__(self):
@@ -61,21 +62,50 @@ class UARTHardwareClient:
         except:
             pass
     
-    def request_sensors(self):
-        self.send_command({"cmd": "get_sensors"})
+    def read_raw_telemetry(self):
+        """Pobiera surową linię tekstu z bufora UART."""
+        if not self.uart or not self.connected: return None
         try:
             line = self.uart.readline()
             if line: return json.loads(line.decode('utf-8'))
         except:
             pass
-        # Fallback bezpieczny (makieta w przypadku awarii przewodu)
-        return {"lidar": [{"d": SENSOR_RANGE, "hit": False} for _ in range(NUM_SENSORS)]}
+        return None
 
     def send_motors(self, fl: float, fr: float, rl: float, rr: float):
-        self.send_command({"cmd": "set_motors", "fl": fl, "fr": fr, "rl": rl, "rr": rr})
+        self.send_command({"raw": [fl, fr, rl, rr]})
 
 # ============================================================
-# KINEMATYKA KÓŁ MECANUM (Zgodna z Twoim API 2.3)
+# 🎯 INTEGRACJA: PASYWNE API CZUJNIKÓW (PARSER TELEMETRII)
+# ============================================================
+class SensorAPI:
+    def __init__(self, uart_client: UARTHardwareClient):
+        self.uart_client = uart_client
+        
+    def get_processed_lidar(self) -> list:
+        """
+        Odpytuje ESP32 Hardware i przetwarza surowe odczyty ToF
+        na ujednoliconą, bezpieczną strukturę logiczną drona.
+        """
+        self.uart_client.send_command({"cmd": "get_sensors"})
+        raw_data = self.uart_client.read_raw_telemetry()
+        
+        # Fallback bezpieczeństwa w przypadku zerwania ramki lub przewodu UART
+        if not raw_data or "lidar" not in raw_data:
+            return [{"d": SENSOR_RANGE, "hit": False} for _ in range(NUM_SENSORS)]
+        
+        processed_beams = []
+        for sensor in raw_data["lidar"]:
+            dist = float(sensor.get("d", SENSOR_RANGE))
+            # Sensor zgłasza trafienie (hit=True) tylko gdy przeszkoda jest w zasięgu operacyjnym
+            processed_beams.append({
+                "d": dist,
+                "hit": dist < (SENSOR_RANGE - 50.0)
+            })
+        return processed_beams
+
+# ============================================================
+# 🏎️ KINEMATYKA KÓŁ MECANUM (Zgodna z Twoim API 2.3)
 # ============================================================
 def mix_mecanum(vx: float, vy: float, w: float) -> list:
     fl = vy + vx + w
@@ -89,15 +119,15 @@ def mix_mecanum(vx: float, vy: float, w: float) -> list:
     return [fl, fr, rl, rr]
 
 # ============================================================
-# RDZEŃ AUTONOMII (DFS + BFS + Korekta Odometrii)
+# 🤖 RDZEŃ AUTONOMII (DFS + BFS + Korekta Odometrii)
 # ============================================================
 class RobotController:
-    def __init__(self, uart_client: UARTHardwareClient = None):
+    def __init__(self, sensor_api: SensorAPI):
         self.armed = False
         self.estop = False
         self.finished = False
         
-        # Start z bezpiecznego środka kafelka (1,1) w milimetrach
+        # Start ze środka kafelka (1,1) w mm
         self.pos_x = WALL_THICK + PATH_WIDTH / 2.0
         self.pos_y = WALL_THICK + PATH_WIDTH / 2.0
         self.heading = 0.0
@@ -117,18 +147,14 @@ class RobotController:
         self.goal_cell = None
         self.optimized_path = []
         
-        self.uart_client = uart_client
+        self.sensors = sensor_api
         self.last_cmd_sent = {"vx": 0.0, "vy": 0.0, "w": 0.0}
 
-    def calibrate_start_position(self, sensor_payload):
-        """Autokalibracja startowa ToF (Twój genialny pomysł!)"""
+    def calibrate_start_position(self, lidar_data):
+        """Autokalibracja startowa ToF ze ścianami (Twój pomysł)."""
         try:
-            if not sensor_payload or "lidar" not in sensor_payload: return False
-            lidar = sensor_payload["lidar"]
-            
-            # Pobranie rzutów cosinusowych dla skośnych ToF (60° i 240° -> rzut boczny = * 0.866)
-            d_back = lidar[3]["d"]
-            d_left = lidar[4]["d"] * 0.866
+            d_back = lidar_data[3]["d"]
+            d_left = lidar_data[4]["d"] * 0.866 # Rzut cosinusowy czujnika skośnego 240°
             
             self.pos_x = d_left + (ROBOT_W_WIDTH / 2.0)
             self.pos_y = d_back + (ROBOT_L_LENGTH / 2.0)
@@ -138,10 +164,10 @@ class RobotController:
         except:
             return False
 
-    def update_slam(self, sensor_payload):
-        """Aktualizuje pozycję na bazie odometrii poleceń i nanosi fizyczne ściany."""
+    def update_slam(self, lidar_data):
+        """Aktualizuje pozycję na bazie odometrii poleceń i nanosi ściany z API czujników."""
         dt = 0.04 # 25 Hz
-        speed_scale = 180.0 # Rzeczywista prędkość silników w mm/s przy wypełnieniu 1.0
+        speed_scale = 180.0 # mm/s przy pełnej mocy
         
         self.heading += self.last_cmd_sent["w"] * 1.2 * dt
         self.pos_x += (self.last_cmd_sent["vx"] * math.cos(self.heading) - self.last_cmd_sent["vy"] * math.sin(self.heading)) * speed_scale * dt
@@ -157,12 +183,12 @@ class RobotController:
             self.max_r = max(self.max_r, cell_r)
             self.max_c = max(self.max_c, cell_c)
 
-        # Mapowanie ścian z czujników ToF (Wykrywanie fizycznych przeszkód)
-        if sensor_payload and "lidar" in sensor_payload:
-            lidar = sensor_payload["lidar"]
-            r, c = self.current_cell
-            if lidar[0]["d"] < 140.0: self.logic_map[r+1][c] = 1 # Ściana z przodu
-            else:                     self.logic_map[r+1][c] = 0
+        # Korzystanie z ujednoliconej struktury przetworzonej przez SensorAPI
+        r, c = self.current_cell
+        if lidar_data[0]["hit"] and lidar_data[0]["d"] < 140.0: 
+            self.logic_map[r+1][c] = 1 # Wykryto fizyczną ścianę z przodu (Północ)
+        else:
+            self.logic_map[r+1][c] = 0
 
     def find_next_target(self):
         r, c = self.current_cell
@@ -226,7 +252,7 @@ class RobotController:
         return {"vx": 0.3 * math.cos(ang), "vy": 0.3 * math.sin(ang), "w": max(-0.2, min(0.2, ang * 0.4))}
 
 # ============================================================
-# 💻 EMBEDDED CYBERPUNK DASHBOARD (Natywny Serwer dla Telefonu)
+# 💻 EMBEDDED WEB DASHBOARD (Natywny Serwer dla Telefonu)
 # ============================================================
 html_dashboard = """<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Drone Console</title><style>
@@ -258,7 +284,6 @@ setInterval(async () => {
 hmi_command_signal = None
 
 async def hmi_web_server():
-    """Lekki, asynchroniczny serwer HTTP obsługujący żądania telefonu."""
     global hmi_command_signal
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.setblocking(False)
@@ -275,95 +300,96 @@ async def hmi_web_server():
                 req = conn.recv(512).decode('utf-8')
                 
                 if "GET /api" in req:
-                    # Parsowanie komend z parametrów URL
                     if "cmd=start" in req: hmi_command_signal = "start"
                     elif "cmd=kill" in req: hmi_command_signal = "kill"
                     elif "cmd=resume" in req: hmi_command_signal = "resume"
                     
-                    # Zwrot telemetrii w formacie JSON
                     from __main__ import current_live_mode, current_live_cell
                     status_payload = {"mode": current_live_mode, "cell": current_live_cell}
                     conn.send("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n" + json.dumps(status_payload))
                 else:
-                    # Zwrot interfejsu graficznego HTML
                     conn.send("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n" + html_dashboard)
                 conn.close()
         except:
             pass
         await asyncio.sleep_ms(40)
 
-# ============================================================
-# GLOBALNE ZMIENNE STANU DLA SERWERA
-# ============================================================
+# Variables for live synchronization with web display
 current_live_mode = "stopped"
 current_live_cell = [1, 1]
 
 async def main():
     global hmi_command_signal, current_live_mode, current_live_cell
     
-    # 1. Konfiguracja Access Pointu Wi-Fi drona (Telefon łączy się bezpośrednio tutaj)
+    # 1. Konfiguracja punktu dostępowego bazy (Wi-Fi AP)
     ap = network.WLAN(network.AP_IF)
     ap.active(True)
     ap.config(essid="Mecanum_Drone_AP", password="robot_password_2026")
-    print("[WIFI] Sieć aktywna. Połącz telefon z 'Mecanum_Drone_AP' i wejdź na 192.168.4.1:8080")
+    print("[WIFI] Połącz się z siecią 'Mecanum_Drone_AP' i otwórz w przeglądarce 192.168.4.1:8080")
 
-    # 2. Odpalenie wbudowanego Dashboardu
+    # 2. Uruchomienie asynchronicznej obsługi Web HMI
     asyncio.create_task(hmi_web_server())
 
-    # 3. Synchronizacja szyny UART z ESP32 Hardware
+    # 3. Synchronizacja połączenia magistrali UART
     uart_client = UARTHardwareClient()
     if not uart_client.init(): return
         
-    controller = RobotController(uart_client)
+    # Inicjalizacja instancji interfejsu API sensorów oraz głównego kontrolera
+    sensor_api = SensorAPI(uart_client)
+    controller = RobotController(sensor_api)
     
-    # Blokada startowa: Czekamy, aż klikniesz "START EXPLORATION" na telefonie
+    # Blokada pętli: Oczekiwanie na kliknięcie przycisku przez operatora HMI
     while True:
         if hmi_command_signal == "start":
             hmi_command_signal = None
             break
         await asyncio.sleep_ms(100)
 
-    # 4. Odczyt początkowy i autokalibracja startowa ToF (Centrowanie pasa)
-    initial_sensors = uart_client.request_sensors()
-    controller.calibrate_start_position(initial_sensors)
+    # 4. Inicjalne próbkowanie i kalibracja startowa ToF za pomocą SensorAPI
+    initial_lidar_profile = sensor_api.get_processed_lidar()
+    controller.calibrate_start_position(initial_lidar_profile)
     
-    # 5. Bezpieczne uzbrojenie (Seria komend zerowych) [Zgodnie z Twym API 3.0]
+    # 5. Bezpieczne uzbrojenie bazy (Neutralne impulsy PWM)
     for _ in range(10):
         uart_client.send_motors(0.0, 0.0, 0.0, 0.0)
         await asyncio.sleep_ms(20)
     controller.arm()
     
-    # 6. Główna pętla wykonawcza 25 Hz
+    print("[MAIN] Pętla 25 Hz uruchomiona pomyślnie.")
+    
+    # 6. Główna pętla wykonawcza czasu rzeczywistego
     while not controller.finished:
         if hmi_command_signal:
             if hmi_command_signal == "kill": controller.emergency_stop()
             elif hmi_command_signal == "resume": controller.resume()
             hmi_command_signal = None
 
-        # Pobranie odczytów i aktualizacja SLAM
-        sensor_data = uart_client.request_sensors()
-        controller.update_slam(sensor_data)
+        # Pobranie ujednoliconych danych z czujników ToF poprzez instancję API
+        lidar_data = sensor_api.get_processed_lidar()
         
-        # Aktualizacja zmiennych globalnych dla Dashboardu w telefonie
+        # Przetworzenie danych ToF na mapę logiczną korytarzy labiryntu i aktualizacja SLAM
+        controller.update_slam(lidar_data)
+        
+        # Odświeżenie danych telemetrycznych HMI dla telefonu komórkowego
         current_live_mode = "explore" if not controller.fast_run else "speedrun"
         if controller.estop: current_live_mode = "EMERGENCY STOP"
         current_live_cell = list(controller.current_cell)
 
-        # Obliczenie ruchu i miksowanie na 4 koła Mecanum
+        # Obliczenie kolejnego kroku DFS/BFS oraz dystrybucja wektorów kół Mecanum
         command = controller.get_movement_command()
         controller.last_cmd_sent = command
         speeds = mix_mecanum(command["vx"], command["vy"], command["w"])
         
-        # Wypchnięcie PWM po UART do kontrolera sprzętowego
+        # Przesłanie ramki wykonawczej po kablu UART do sterownika silników (ESP32 #1)
         uart_client.send_motors(speeds[0], speeds[1], speeds[2], speeds[3])
         
         await asyncio.sleep_ms(int(1000 / COMMAND_RATE_HZ))
 
-    print("[FINISHED] Wyścig zakończony. Zamykanie systemów.")
+    print("[FINISHED] Wyścig zakończony. Odcięcie zasilania silników.")
     uart_client.send_motors(0.0, 0.0, 0.0, 0.0)
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except Exception as e:
-        print("[CRASH] Krytyczny błąd jądra systemu:", e)
+        print("[CRASH] Fatalny błąd jądra systemu MicroPython:", e)
